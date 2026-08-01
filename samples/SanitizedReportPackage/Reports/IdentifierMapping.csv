@@ -1,0 +1,2 @@
+﻿"ObjectType","SourceSchema","SourceName","SourceQualified","TargetSchema","TargetName","TargetQualified","Reason"
+"Table","dbo","Table1","[dbo].[Table1]","public","table1","public.table1","lowercase"

@@ -1,0 +1,19 @@
+<Project Sdk="WixToolset.Sdk/5.0.2">
+
+  <PropertyGroup>
+    <ProductVersion Condition="'$(ProductVersion)' == ''">1.0.12</ProductVersion>
+    <OutputName>MigrationStudio-$(ProductVersion)-x64</OutputName>
+    <OutputType>Package</OutputType>
+    <Platform>x64</Platform>
+    <PublishDirectory Condition="'$(PublishDirectory)' == ''">$(MSBuildThisFileDirectory)..\artifacts\release\$(ProductVersion)\self-contained</PublishDirectory>
+    <DefineConstants>PublishDirectory=$(PublishDirectory);ProductVersion=$(ProductVersion)</DefineConstants>
+    <!-- ICE validation depends on a locally available Windows Installer service and is
+         therefore exercised by the release smoke test rather than during CI compilation. -->
+    <SuppressValidation>true</SuppressValidation>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.UI.wixext" />
+  </ItemGroup>
+
+</Project>

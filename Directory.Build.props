@@ -1,0 +1,24 @@
+<Project>
+  <PropertyGroup>
+    <LangVersion>12.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <RestoreLockedMode Condition="'$(CI)' == 'true'">true</RestoreLockedMode>
+    <VersionPrefix>1.0.12</VersionPrefix>
+    <Version>1.0.12</Version>
+    <AssemblyVersion>1.0.12.0</AssemblyVersion>
+    <FileVersion>1.0.12.0</FileVersion>
+    <InformationalVersion>1.0.12</InformationalVersion>
+    <Product>SQL Server to PostgreSQL Migration Studio</Product>
+    <Company>Migration Studio</Company>
+    <Authors>Migration Studio</Authors>
+    <Copyright>Copyright © 2026 Migration Studio</Copyright>
+    <Description>Commercial-grade SQL Server to PostgreSQL migration, deployment, validation, and reporting studio.</Description>
+  </PropertyGroup>
+</Project>

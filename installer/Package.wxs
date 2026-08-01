@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package
+      Name="SQL Server to PostgreSQL Migration Studio"
+      Manufacturer="Migration Studio"
+      Version="$(var.ProductVersion)"
+      UpgradeCode="{1C59A0AB-4C77-44C4-8CB1-E3308476445D}"
+      Language="1033"
+      Codepage="1252"
+      InstallerVersion="500"
+      Scope="perMachine"
+      Compressed="yes">
+
+    <SummaryInformation
+        Description="SQL Server to PostgreSQL Migration Studio $(var.ProductVersion)"
+        Manufacturer="Migration Studio" />
+    <MajorUpgrade
+        Schedule="afterInstallInitialize"
+        DowngradeErrorMessage="A newer version of SQL Server to PostgreSQL Migration Studio is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="SQL Server to PostgreSQL Migration Studio" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="SQL Server to PostgreSQL Migration Studio" />
+    </StandardDirectory>
+    <StandardDirectory Id="DesktopFolder" />
+
+    <ComponentGroup Id="ApplicationFiles" Directory="INSTALLFOLDER">
+      <Files Include="$(var.PublishDirectory)\**">
+        <Exclude Files="$(var.PublishDirectory)\*.pdb" />
+      </Files>
+    </ComponentGroup>
+
+    <Component Id="StartMenuShortcut" Directory="ApplicationProgramsFolder" Guid="*">
+      <Shortcut
+          Id="StartMenuApplicationShortcut"
+          Name="SQL Server to PostgreSQL Migration Studio"
+          Description="Migrate SQL Server databases to PostgreSQL"
+          Target="[INSTALLFOLDER]MigrationStudio.exe"
+          WorkingDirectory="INSTALLFOLDER" />
+      <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+      <RegistryValue
+          Root="HKLM"
+          Key="Software\Migration Studio\SQL Server to PostgreSQL Migration Studio"
+          Name="StartMenuShortcut"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+    </Component>
+
+    <Component Id="DesktopShortcut" Directory="DesktopFolder" Guid="*">
+      <Shortcut
+          Id="DesktopApplicationShortcut"
+          Name="SQL Server to PostgreSQL Migration Studio"
+          Description="Migrate SQL Server databases to PostgreSQL"
+          Target="[INSTALLFOLDER]MigrationStudio.exe"
+          WorkingDirectory="INSTALLFOLDER" />
+      <RegistryValue
+          Root="HKLM"
+          Key="Software\Migration Studio\SQL Server to PostgreSQL Migration Studio"
+          Name="DesktopShortcut"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+    </Component>
+
+    <Feature Id="ProductFeature" Title="Application" Level="1" Display="expand">
+      <ComponentGroupRef Id="ApplicationFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <Feature
+          Id="DesktopShortcutFeature"
+          Title="Desktop shortcut"
+          Description="Create a desktop shortcut."
+          Level="1"
+          AllowAbsent="yes">
+        <ComponentRef Id="DesktopShortcut" />
+      </Feature>
+    </Feature>
+
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <ui:WixUI Id="WixUI_FeatureTree" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(sys.SOURCEFILEDIR)License.rtf" />
+  </Package>
+</Wix>

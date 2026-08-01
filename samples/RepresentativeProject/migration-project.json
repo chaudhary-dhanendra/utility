@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "name": "Representative Release Fixture",
+  "scope": "CompleteDatabase",
+  "targetPostgreSqlVersion": 18,
+  "identifierCase": "LowercaseUnquoted",
+  "schemaMapping": "MapDboToPublic",
+  "identityStrategy": "GeneratedByDefaultAsIdentity",
+  "securityStrategy": "ReportOnly",
+  "dataMigration": {
+    "mode": "SchemaAndData",
+    "parallelism": "Adaptive",
+    "batchRowCount": 5000,
+    "batchByteSize": 33554432
+  },
+  "validation": {
+    "level": "Full",
+    "sampleSize": 1000,
+    "chunkSize": 10000
+  },
+  "credentials": "Not stored. Supply source and target credentials interactively."
+}

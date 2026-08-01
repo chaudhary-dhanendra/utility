@@ -1,0 +1,43 @@
+<UserControl x:Class="MigrationStudio.Desktop.Views.SettingsView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel MaxWidth="760" HorizontalAlignment="Left">
+            <TextBlock FontSize="28" FontWeight="SemiBold" Text="{Binding Title}" />
+
+            <TextBlock Margin="0,24,0,6" FontWeight="SemiBold" Text="Theme" />
+            <ComboBox Width="220" HorizontalAlignment="Left"
+                      ItemsSource="{Binding Themes}" SelectedItem="{Binding SelectedTheme}" />
+
+            <CheckBox Margin="0,22,0,0" Content="Confirm before closing the application"
+                      IsChecked="{Binding ConfirmBeforeExit}" />
+
+            <TextBlock Margin="0,22,0,6" FontWeight="SemiBold" Text="Default experience" />
+            <ComboBox Width="220" HorizontalAlignment="Left"
+                      ItemsSource="{Binding ExperienceModes}"
+                      SelectedItem="{Binding SelectedExperienceMode}" />
+            <TextBlock MaxWidth="600" Margin="0,6,0,0"
+                       Foreground="{DynamicResource SecondaryTextBrush}"
+                       Text="Simple opens the guided eight-step workflow. Advanced keeps all engineering tools available."
+                       TextWrapping="Wrap" />
+
+            <TextBlock Margin="0,22,0,6" FontWeight="SemiBold" Text="Maximum background workers" />
+            <DockPanel HorizontalAlignment="Left">
+                <Slider Width="260" Minimum="1" Maximum="16"
+                        IsSnapToTickEnabled="True" TickFrequency="1"
+                        Value="{Binding MaximumConcurrentOperations}" />
+                <TextBlock Width="30" Margin="12,0,0,0" VerticalAlignment="Center"
+                           Text="{Binding MaximumConcurrentOperations}" />
+            </DockPanel>
+            <TextBlock MaxWidth="600" Margin="0,6,0,0"
+                       Foreground="{DynamicResource SecondaryTextBrush}"
+                       Text="The worker count is applied when Migration Studio next starts."
+                       TextWrapping="Wrap" />
+
+            <StackPanel Margin="0,28,0,0" Orientation="Horizontal">
+                <Button Width="120" Command="{Binding SaveCommand}" Content="Save settings" />
+                <TextBlock Margin="14,0,0,0" VerticalAlignment="Center" Text="{Binding SaveStatus}" />
+            </StackPanel>
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

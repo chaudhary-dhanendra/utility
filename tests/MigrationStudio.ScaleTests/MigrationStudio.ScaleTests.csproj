@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <RootNamespace>MigrationStudio.ScaleTests</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\MigrationStudio.Application\MigrationStudio.Application.csproj" />
+    <ProjectReference Include="..\..\src\MigrationStudio.Domain\MigrationStudio.Domain.csproj" />
+    <ProjectReference Include="..\..\src\MigrationStudio.Infrastructure\MigrationStudio.Infrastructure.csproj" />
+    <ProjectReference Include="..\..\src\MigrationStudio.Reporting\MigrationStudio.Reporting.csproj" />
+    <ProjectReference Include="..\..\src\MigrationStudio.Desktop\MigrationStudio.Desktop.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="ClosedXML" />
+  </ItemGroup>
+</Project>

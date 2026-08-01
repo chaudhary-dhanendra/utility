@@ -1,0 +1,47 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AssemblyName>MigrationStudio</AssemblyName>
+    <RootNamespace>MigrationStudio.Desktop</RootNamespace>
+    <BuildTimestamp Condition="'$(BuildTimestamp)' == ''">$([System.DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"))</BuildTimestamp>
+    <CommitHash Condition="'$(CommitHash)' == ''">unavailable</CommitHash>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>BuildTimestamp</_Parameter1>
+      <_Parameter2>$(BuildTimestamp)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>CommitHash</_Parameter1>
+      <_Parameter2>$(CommitHash)</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MigrationStudio.Application\MigrationStudio.Application.csproj" />
+    <ProjectReference Include="..\MigrationStudio.Domain\MigrationStudio.Domain.csproj" />
+    <ProjectReference Include="..\MigrationStudio.Infrastructure\MigrationStudio.Infrastructure.csproj" />
+    <ProjectReference Include="..\MigrationStudio.Reporting\MigrationStudio.Reporting.csproj" />
+    <ProjectReference Include="..\MigrationStudio.Deployment\MigrationStudio.Deployment.csproj" />
+    <ProjectReference Include="..\MigrationStudio.Validation\MigrationStudio.Validation.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="CommunityToolkit.Mvvm" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" />
+    <PackageReference Include="Serilog.Extensions.Hosting" />
+    <PackageReference Include="Serilog.Sinks.File" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="appsettings.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>

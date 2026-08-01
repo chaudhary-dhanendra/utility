@@ -1,0 +1,201 @@
+<Window x:Class="MigrationStudio.Desktop.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:navigation="clr-namespace:MigrationStudio.Application.Navigation;assembly=MigrationStudio.Application"
+        xmlns:ribbon="clr-namespace:System.Windows.Controls.Ribbon;assembly=System.Windows.Controls.Ribbon"
+        mc:Ignorable="d"
+        Title="SQL Server to PostgreSQL Migration Studio"
+        Width="1440"
+        Height="900"
+        MinWidth="1024"
+        MinHeight="680"
+        WindowStartupLocation="CenterScreen">
+    <Grid Background="{DynamicResource WindowBackgroundBrush}">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <ribbon:Ribbon Grid.Row="0"
+                       Height="138"
+                       Background="{DynamicResource RibbonBackgroundBrush}"
+                       BorderBrush="{DynamicResource BorderBrush}"
+                       Title="Migration Studio">
+            <ribbon:RibbonTab Header="Home">
+                <ribbon:RibbonGroup Header="Navigation">
+                    <ribbon:RibbonButton Command="{Binding NavigateCommand}"
+                                         CommandParameter="{x:Static navigation:NavigationRoute.Home}"
+                                         Label="Home" />
+                    <ribbon:RibbonButton Command="{Binding NavigateCommand}"
+                                         CommandParameter="{x:Static navigation:NavigationRoute.Workspace}"
+                                         Label="Migration Wizard" />
+                    <ribbon:RibbonButton Command="{Binding NavigateCommand}"
+                                         CommandParameter="{x:Static navigation:NavigationRoute.AdvancedWorkspace}"
+                                         Label="Advanced Workspace" />
+                    <ribbon:RibbonButton Command="{Binding GoBackCommand}"
+                                         IsEnabled="{Binding CanGoBack}"
+                                         Label="Back" />
+                </ribbon:RibbonGroup>
+                <ribbon:RibbonGroup Header="Experience">
+                    <ribbon:RibbonButton Command="{Binding UseSimpleModeCommand}"
+                                         Label="Simple Mode" />
+                    <ribbon:RibbonButton Command="{Binding UseAdvancedModeCommand}"
+                                         Label="Advanced Mode" />
+                </ribbon:RibbonGroup>
+                <ribbon:RibbonGroup Header="Results">
+                    <ribbon:RibbonButton Command="{Binding NavigateCommand}"
+                                         CommandParameter="{x:Static navigation:NavigationRoute.Reports}"
+                                         Label="Reports" />
+                </ribbon:RibbonGroup>
+                <ribbon:RibbonGroup Header="Application">
+                    <ribbon:RibbonButton Command="{Binding NavigateCommand}"
+                                         CommandParameter="{x:Static navigation:NavigationRoute.Plugins}"
+                                         Label="Plugins" />
+                    <ribbon:RibbonButton Command="{Binding NavigateCommand}"
+                                         CommandParameter="{x:Static navigation:NavigationRoute.Settings}"
+                                         Label="Settings" />
+                    <ribbon:RibbonButton Command="{Binding ShowAboutCommand}"
+                                         Label="About" />
+                </ribbon:RibbonGroup>
+            </ribbon:RibbonTab>
+            <ribbon:RibbonTab Header="View">
+                <ribbon:RibbonGroup Header="Docking windows">
+                    <ribbon:RibbonButton Command="{Binding ToggleExplorerCommand}" Label="Explorer" />
+                    <ribbon:RibbonButton Command="{Binding ToggleInspectorCommand}" Label="Inspector" />
+                    <ribbon:RibbonButton Command="{Binding ToggleOutputCommand}" Label="Output" />
+                </ribbon:RibbonGroup>
+            </ribbon:RibbonTab>
+            <ribbon:RibbonTab Header="Tools">
+                <ribbon:RibbonGroup Header="SQL Server diagnostics">
+                    <ribbon:RibbonButton Command="{Binding OpenDiscoveryDoctorCommand}"
+                                         Label="Discovery Doctor" />
+                    <ribbon:RibbonButton Command="{Binding RunDatabaseCompatibilityAuditCommand}"
+                                         Label="Database Compatibility Audit" />
+                    <ribbon:RibbonButton Command="{Binding OpenCatalogQueryExplorerCommand}"
+                                         Label="Catalog Query Explorer" />
+                    <ribbon:RibbonButton Command="{Binding ExportDiagnosticsCommand}"
+                                         Label="Export Diagnostics" />
+                    <ribbon:RibbonButton Command="{Binding OpenLogFolderCommand}"
+                                         Label="Open Log Folder" />
+                </ribbon:RibbonGroup>
+                <ribbon:RibbonGroup Header="Extensions">
+                    <ribbon:RibbonButton Command="{Binding NavigateCommand}"
+                                         CommandParameter="{x:Static navigation:NavigationRoute.Plugins}"
+                                         Label="Plugins" />
+                </ribbon:RibbonGroup>
+                <ribbon:RibbonGroup Header="Preferences">
+                    <ribbon:RibbonButton Command="{Binding NavigateCommand}"
+                                         CommandParameter="{x:Static navigation:NavigationRoute.Settings}"
+                                         Label="Options" />
+                </ribbon:RibbonGroup>
+            </ribbon:RibbonTab>
+        </ribbon:Ribbon>
+
+        <Grid Grid.Row="1">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*" />
+                <RowDefinition Height="5" />
+                <RowDefinition Height="{Binding OutputHeight, Mode=TwoWay}" />
+            </Grid.RowDefinitions>
+
+            <Grid Grid.Row="0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="{Binding ExplorerWidth, Mode=TwoWay}" />
+                    <ColumnDefinition Width="5" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="5" />
+                    <ColumnDefinition Width="{Binding InspectorWidth, Mode=TwoWay}" />
+                </Grid.ColumnDefinitions>
+
+                <Border Grid.Column="0"
+                        Background="{DynamicResource PanelBackgroundBrush}"
+                        BorderBrush="{DynamicResource BorderBrush}"
+                        BorderThickness="0,0,1,0">
+                    <DockPanel>
+                        <TextBlock Margin="12,10" DockPanel.Dock="Top"
+                                   FontWeight="SemiBold" Text="Migration Explorer" />
+                        <TreeView Margin="6" Background="Transparent" BorderThickness="0">
+                            <TreeViewItem Header="Workspace">
+                                <TreeViewItem Header="Source Database" />
+                                <TreeViewItem Header="Target Database" />
+                                <TreeViewItem Header="Migration Plan" />
+                                <TreeViewItem Header="Execution History" />
+                            </TreeViewItem>
+                        </TreeView>
+                    </DockPanel>
+                </Border>
+
+                <GridSplitter Grid.Column="1" HorizontalAlignment="Stretch"
+                              Background="{DynamicResource SplitterBrush}" ResizeDirection="Columns" />
+
+                <Border Grid.Column="2" Margin="8" Padding="20"
+                        Background="{DynamicResource ContentBackgroundBrush}"
+                        BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="4">
+                    <ContentControl Content="{Binding CurrentPage}" />
+                </Border>
+
+                <GridSplitter Grid.Column="3" HorizontalAlignment="Stretch"
+                              Background="{DynamicResource SplitterBrush}" ResizeDirection="Columns" />
+
+                <Border Grid.Column="4"
+                        Background="{DynamicResource PanelBackgroundBrush}"
+                        BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1,0,0,0">
+                    <StackPanel>
+                        <TextBlock Margin="12,10" FontWeight="SemiBold" Text="Inspector" />
+                        <TextBlock Margin="12,4" Foreground="{DynamicResource SecondaryTextBrush}"
+                                   Text="Select a migration object to view its properties, diagnostics, and conversion decisions."
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+                </Border>
+            </Grid>
+
+            <GridSplitter Grid.Row="1" HorizontalAlignment="Stretch"
+                          Background="{DynamicResource SplitterBrush}" ResizeDirection="Rows" />
+
+            <Border Grid.Row="2"
+                    Background="{DynamicResource PanelBackgroundBrush}"
+                    BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,1,0,0">
+                <DockPanel>
+                    <TextBlock Margin="12,8" DockPanel.Dock="Top"
+                               FontWeight="SemiBold" Text="Operations" />
+                    <DataGrid Margin="8,0,8,8" AutoGenerateColumns="False"
+                              IsReadOnly="True" ItemsSource="{Binding Operations}">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Width="2*" Binding="{Binding Name}" Header="Operation" />
+                            <DataGridTextColumn Width="*" Binding="{Binding State}" Header="State" />
+                            <DataGridTextColumn Width="*" Binding="{Binding Progress.Percentage, StringFormat={}{0:F0}%}"
+                                                Header="Progress" />
+                            <DataGridTextColumn Width="3*" Binding="{Binding Progress.Message}" Header="Message" />
+                            <DataGridTextColumn Width="*" Binding="{Binding Progress.Conversion.Stage}" Header="Stage" />
+                            <DataGridTextColumn Width="*" Binding="{Binding Progress.Conversion.Processed, StringFormat={}{0:N0}}" Header="Processed" />
+                            <DataGridTextColumn Width="*" Binding="{Binding Progress.Conversion.Total, StringFormat={}{0:N0}}" Header="Total" />
+                            <DataGridTextColumn Width="*" Binding="{Binding Progress.Conversion.Elapsed, StringFormat={}{0:g}}" Header="Elapsed" />
+                            <DataGridTextColumn Width="*" Binding="{Binding Progress.Conversion.IsResponsive}" Header="Responsive" />
+                            <DataGridTextColumn Width="*" Binding="{Binding Failure.Stage}" Header="Failed stage" />
+                            <DataGridTextColumn Width="2*" Binding="{Binding Failure.QueryId}" Header="Query ID" />
+                            <DataGridTextColumn Width="3*" Binding="{Binding Failure.Remediation}" Header="Remediation" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </DockPanel>
+            </Border>
+        </Grid>
+
+        <StatusBar Grid.Row="2"
+                   Background="{DynamicResource StatusBarBackgroundBrush}"
+                   Foreground="{DynamicResource StatusBarForegroundBrush}">
+            <StatusBarItem>
+                <TextBlock MinWidth="280" Text="{Binding StatusText}" />
+            </StatusBarItem>
+            <Separator />
+            <StatusBarItem Visibility="{Binding IsProgressVisible, Converter={StaticResource BooleanToVisibilityConverter}}">
+                <ProgressBar Width="180" Height="14" Maximum="100" Value="{Binding ProgressPercentage}" />
+            </StatusBarItem>
+            <StatusBarItem HorizontalAlignment="Right">
+                <TextBlock Text="{Binding VersionDisplay, Mode=OneWay}" />
+            </StatusBarItem>
+        </StatusBar>
+    </Grid>
+</Window>

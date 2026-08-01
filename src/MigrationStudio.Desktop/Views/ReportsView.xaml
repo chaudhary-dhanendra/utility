@@ -1,0 +1,121 @@
+<UserControl x:Class="MigrationStudio.Desktop.Views.ReportsView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <DockPanel>
+        <Grid DockPanel.Dock="Top" Margin="0,0,0,10">
+            <Grid.ColumnDefinitions><ColumnDefinition /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+            <StackPanel>
+                <TextBlock FontSize="28" FontWeight="SemiBold" Text="{Binding Title}" />
+                <TextBlock Foreground="{DynamicResource SecondaryTextBrush}" Text="{Binding Status}" TextWrapping="Wrap" />
+            </StackPanel>
+            <WrapPanel Grid.Column="1">
+                <Button Command="{Binding RefreshCommand}" Content="Refresh" />
+                <Button Command="{Binding GenerateReportCommand}" Content="Generate report package" />
+                <Button Command="{Binding ExportSanitizedLogsCommand}" Content="Export sanitized logs" />
+                <Button Command="{Binding OpenWorkspaceCommand}" Content="Open migration workspace" />
+            </WrapPanel>
+        </Grid>
+        <ProgressBar DockPanel.Dock="Top" Height="10" Margin="0,0,0,10" Maximum="100" Value="{Binding Progress}" />
+        <UniformGrid DockPanel.Dock="Top" Columns="6" Margin="0,0,0,10">
+            <GroupBox Header="Overall"><TextBlock FontSize="17" Text="{Binding OverallStatus}" /></GroupBox>
+            <GroupBox Header="Objects"><TextBlock FontSize="17" Text="{Binding ObjectCount}" /></GroupBox>
+            <GroupBox Header="Rows written"><TextBlock FontSize="17" Text="{Binding RowsWritten}" /></GroupBox>
+            <GroupBox Header="Deployment failures"><TextBlock FontSize="17" Text="{Binding DeploymentFailures}" /></GroupBox>
+            <GroupBox Header="Critical blockers"><TextBlock FontSize="17" Text="{Binding CriticalBlockers}" /></GroupBox>
+            <GroupBox Header="Open reviews"><TextBlock FontSize="17" Text="{Binding OpenManualReviews}" /></GroupBox>
+        </UniformGrid>
+        <TabControl>
+            <TabItem Header="Dashboard">
+                <Grid Margin="12">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="220" /><ColumnDefinition Width="420" /></Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <TextBlock Text="Source server" /><TextBox Grid.Column="1" Text="{Binding SourceServer}" />
+                    <TextBlock Grid.Row="1" Text="Target server" /><TextBox Grid.Row="1" Grid.Column="1" Text="{Binding TargetServer}" />
+                    <TextBlock Grid.Row="2" Text="Organization" /><TextBox Grid.Row="2" Grid.Column="1" Text="{Binding OrganizationName}" />
+                    <TextBlock Grid.Row="3" Text="Project name" /><TextBox Grid.Row="3" Grid.Column="1" Text="{Binding ProjectName}" />
+                    <TextBlock Grid.Row="4" Text="Report title" /><TextBox Grid.Row="4" Grid.Column="1" Text="{Binding ReportTitle}" />
+                    <TextBlock Grid.Row="5" Text="Prepared by" /><TextBox Grid.Row="5" Grid.Column="1" Text="{Binding PreparedBy}" />
+                    <TextBlock Grid.Row="6" Text="Reviewed by" /><TextBox Grid.Row="6" Grid.Column="1" Text="{Binding ReviewedBy}" />
+                    <TextBlock Grid.Row="7" Text="Classification" /><TextBox Grid.Row="7" Grid.Column="1" Text="{Binding ClassificationMarking}" />
+                    <TextBlock Grid.Row="8" Text="Footer" /><TextBox Grid.Row="8" Grid.Column="1" Text="{Binding Footer}" />
+                    <TextBlock Grid.Row="9" Text="HTML dashboard theme" />
+                    <CheckBox Grid.Row="9" Grid.Column="1" Content="Use optional dark dashboard theme"
+                              IsChecked="{Binding UseDarkDashboardTheme}" />
+                    <TextBlock Grid.Row="10" Text="Logo path (PNG or JPEG)" />
+                    <TextBox Grid.Row="10" Grid.Column="1" Text="{Binding LogoPath}" />
+                    <TextBlock Grid.Row="11" Text="Last report package" />
+                    <TextBox Grid.Row="11" Grid.Column="1" IsReadOnly="True" Text="{Binding LastReportDirectory}" />
+                </Grid>
+            </TabItem>
+            <TabItem Header="Manual review workflow">
+                <Grid Margin="6">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="2*" /><ColumnDefinition Width="3*" /></Grid.ColumnDefinitions>
+                    <DockPanel>
+                        <StackPanel DockPanel.Dock="Top" Orientation="Horizontal">
+                            <Button Command="{Binding SynchronizeFindingsCommand}" Content="Synchronize findings" />
+                            <CheckBox VerticalAlignment="Center" Content="Unresolved blockers only"
+                                      IsChecked="{Binding ShowOnlyUnresolved}" />
+                        </StackPanel>
+                        <DataGrid AutoGenerateColumns="False" IsReadOnly="True"
+                                  ItemsSource="{Binding VisibleManualReviews}"
+                                  SelectedItem="{Binding SelectedManualReview}">
+                            <DataGrid.Columns>
+                                <DataGridTextColumn Binding="{Binding Status}" Header="Status" />
+                                <DataGridCheckBoxColumn Binding="{Binding IsCriticalBlocker, Mode=OneWay}" Header="Critical" IsReadOnly="True" />
+                                <DataGridTextColumn Binding="{Binding Owner}" Header="Owner" />
+                                <DataGridTextColumn Width="2*" Binding="{Binding Title}" Header="Finding" />
+                                <DataGridTextColumn Width="2*" Binding="{Binding Source}" Header="Source" />
+                            </DataGrid.Columns>
+                        </DataGrid>
+                    </DockPanel>
+                    <ScrollViewer Grid.Column="1" Margin="12,0,0,0" VerticalScrollBarVisibility="Auto">
+                        <StackPanel DataContext="{Binding SelectedManualReview}">
+                            <TextBlock FontSize="18" FontWeight="SemiBold" Text="{Binding Title}" TextWrapping="Wrap" />
+                            <TextBlock Margin="0,4" Text="{Binding Description}" TextWrapping="Wrap" />
+                            <TextBlock Text="Owner" /><TextBox Text="{Binding Owner}" />
+                            <TextBlock Text="Status" />
+                            <ComboBox ItemsSource="{Binding DataContext.ManualReviewStatuses, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                                      SelectedItem="{Binding Status}" />
+                            <TextBlock Text="Comments" /><TextBox MinHeight="70" AcceptsReturn="True" Text="{Binding Comments}" />
+                            <TextBlock Text="Resolution" /><TextBox MinHeight="70" AcceptsReturn="True" Text="{Binding Resolution}" />
+                            <TextBlock Text="Target SQL" /><TextBox MinHeight="130" AcceptsReturn="True" FontFamily="Consolas" Text="{Binding TargetSql}" />
+                            <TextBlock Text="Reviewed by" /><TextBox Text="{Binding ReviewedBy}" />
+                            <WrapPanel DataContext="{Binding DataContext, RelativeSource={RelativeSource AncestorType=UserControl}}">
+                                <Button Command="{Binding SaveManualReviewCommand}" Content="Save / mark reviewed" />
+                                <Button Command="{Binding ReopenManualReviewCommand}" Content="Reopen" />
+                            </WrapPanel>
+                        </StackPanel>
+                    </ScrollViewer>
+                </Grid>
+            </TabItem>
+            <TabItem Header="Run history">
+                <DockPanel Margin="6">
+                    <StackPanel DockPanel.Dock="Top" Orientation="Horizontal">
+                        <Button Command="{Binding OpenHistoricalRunCommand}" Content="Open selected run" />
+                        <Button Command="{Binding RegenerateHistoricalReportCommand}"
+                                Content="Regenerate selected report" />
+                    </StackPanel>
+                    <DataGrid AutoGenerateColumns="False" IsReadOnly="True"
+                              ItemsSource="{Binding RunHistory}" SelectedItem="{Binding SelectedHistoryRun}">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Binding="{Binding StartedAt}" Header="Started" />
+                            <DataGridTextColumn Binding="{Binding Kind}" Header="Run type" />
+                            <DataGridTextColumn Binding="{Binding Status}" Header="Status" />
+                            <DataGridTextColumn Width="2*" Binding="{Binding SourceDatabase}" Header="Source" />
+                            <DataGridTextColumn Width="2*" Binding="{Binding TargetDatabase}" Header="Target" />
+                            <DataGridTextColumn Width="3*" Binding="{Binding Summary}" Header="Summary" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </DockPanel>
+            </TabItem>
+            <TabItem Header="Reports">
+                <ListBox Margin="8" ItemsSource="{Binding ReportFiles}" FontFamily="Consolas" />
+            </TabItem>
+        </TabControl>
+    </DockPanel>
+</UserControl>

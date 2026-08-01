@@ -1,0 +1,553 @@
+{
+  "reportSchemaVersion": 1,
+  "summary": {
+    "reportRunId": "b93b6f0a-2178-401d-8c07-bf7b62070baf",
+    "generatedAt": "2026-07-24T10:41:02.2055501+00:00",
+    "applicationVersion": "1.0.0-test",
+    "source": {
+      "server": "\u003Csource\u0026server\u003E",
+      "database": "SanitizedSource",
+      "version": "16.0",
+      "edition": "Developer"
+    },
+    "target": {
+      "server": "postgres.local",
+      "database": "SanitizedTarget",
+      "version": "18",
+      "edition": "PostgreSQL"
+    },
+    "scope": 0,
+    "includedSchemas": [],
+    "includedObjects": 1,
+    "excludedObjects": 0,
+    "schemaConversionResult": "Completed with manual review",
+    "dataMigrationResult": "CompletedWithFailures",
+    "deploymentResult": "SucceededWithWarnings",
+    "validationResult": "NotReady",
+    "overallReadiness": "NotReady",
+    "criticalBlockers": 1,
+    "warnings": 2,
+    "manualReviews": 2,
+    "unsupported": 0,
+    "rowsRead": 10,
+    "rowsWritten": 9,
+    "failedRows": 1,
+    "totalDuration": "00:03:20",
+    "rowsPerSecond": 4.5,
+    "deploymentDuration": "00:01:00",
+    "validationDuration": "00:00:20"
+  },
+  "inventory": {
+    "formatVersion": 1,
+    "discoveryEngineVersion": "test",
+    "applicationVersion": "test",
+    "snapshotTimestamp": "2026-07-24T10:41:02.1946891+00:00",
+    "scopeMode": 0,
+    "database": {
+      "productVersion": "16.0",
+      "productLevel": "RTM",
+      "edition": "Developer",
+      "engineEdition": 3,
+      "databaseName": "SanitizedSource",
+      "databaseId": 5,
+      "owner": "dbo",
+      "compatibilityLevel": 160,
+      "collation": "Latin1_General_100_CI_AS",
+      "containmentType": "NONE",
+      "recoveryModel": "FULL",
+      "isReadOnly": false,
+      "snapshotIsolationState": "OFF",
+      "isReadCommittedSnapshotOn": false,
+      "isAnsiNullDefaultOn": false,
+      "isAnsiNullsOn": true,
+      "isAnsiPaddingOn": true,
+      "isAnsiWarningsOn": true,
+      "isQuotedIdentifierOn": true,
+      "isRecursiveTriggersOn": false,
+      "isTrustworthyOn": false,
+      "isBrokerEnabled": false,
+      "isChangeTrackingEnabled": false,
+      "isEncrypted": false,
+      "queryStoreState": "OFF",
+      "scopedConfigurations": [],
+      "files": [],
+      "filegroups": [],
+      "options": {}
+    },
+    "schemas": [],
+    "objects": [
+      {
+        "id": {
+          "value": "728ea536-1781-5ae6-96ac-553d3753d348"
+        },
+        "sourceDatabase": "SanitizedSource",
+        "sourceSchema": "dbo",
+        "sourceName": "Table1",
+        "qualifiedSourceName": "[dbo].[Table1]",
+        "objectType": 2,
+        "sqlServerObjectId": 1,
+        "parentObjectId": null,
+        "creationDate": null,
+        "modificationDate": null,
+        "isSystemObject": false,
+        "isIncluded": true,
+        "selectionReason": 1,
+        "dependencyCount": 0,
+        "dependentCount": 0,
+        "discoveryWarnings": [],
+        "conversionClassification": 0,
+        "sourceDefinition": "CREATE TABLE dbo.Table1(Id int, password=***)",
+        "sourceDefinitionHash": null,
+        "metadataHash": "hash-1",
+        "extendedProperties": [],
+        "discoveryStatus": 0
+      }
+    ],
+    "tables": [],
+    "columns": [],
+    "constraints": [],
+    "indexes": [],
+    "modules": [],
+    "sequences": [],
+    "userDefinedTypes": [],
+    "synonyms": [],
+    "securityPrincipals": [],
+    "permissions": [],
+    "temporalTables": [],
+    "triggers": [],
+    "changeData": [],
+    "encryption": [],
+    "fullText": [],
+    "serviceBroker": [],
+    "sqlAgentJobs": [],
+    "externalDependencies": [],
+    "partitionFunctions": [],
+    "partitionSchemes": [],
+    "replication": [],
+    "dependencies": [],
+    "dependencyComponents": [],
+    "findings": [
+      {
+        "code": "REPORT.TEST",
+        "severity": 1,
+        "message": "Representative warning.",
+        "objectId": {
+          "value": "728ea536-1781-5ae6-96ac-553d3753d348"
+        },
+        "evidence": null,
+        "remediation": null
+      }
+    ]
+  },
+  "conversion": {
+    "runId": "261abaea-c95d-4c86-b2e6-f9167a82e850",
+    "generatedAt": "2026-07-24T10:41:02.1952156+00:00",
+    "sourceDatabase": "SanitizedSource",
+    "targetVersion": {
+      "major": 18
+    },
+    "options": {
+      "targetVersion": {
+        "major": 18
+      },
+      "identifierCaseMode": 0,
+      "schemaMappingMode": 1,
+      "consolidatedSchema": "public",
+      "schemaMappings": [],
+      "typeOverrides": [],
+      "identityStrategy": 0,
+      "securityStrategy": 0,
+      "userDefinedTypeStrategy": 0,
+      "enablePgCrypto": true,
+      "useRandomUuidForNewSequentialId": true,
+      "enablePostGis": false,
+      "moneyAsNumeric": true,
+      "deferForeignKeysUntilAfterData": true,
+      "emitConstraintStatementsSeparately": true,
+      "synonymStrategy": 0
+    },
+    "identifierMappings": [
+      {
+        "sourceObjectId": {
+          "value": "728ea536-1781-5ae6-96ac-553d3753d348"
+        },
+        "objectType": "Table",
+        "sourceSchema": "dbo",
+        "sourceName": "Table1",
+        "sourceQualifiedName": "[dbo].[Table1]",
+        "targetSchema": "public",
+        "targetName": "table1",
+        "targetQualifiedName": "public.table1",
+        "originalUtf8ByteLength": 6,
+        "targetUtf8ByteLength": 6,
+        "wasShortened": false,
+        "hadCollision": false,
+        "hashSuffix": null,
+        "mappingReason": "lowercase"
+      }
+    ],
+    "typeMappings": [],
+    "artifacts": [
+      {
+        "sourceObjectId": {
+          "value": "728ea536-1781-5ae6-96ac-553d3753d348"
+        },
+        "targetObjectId": {
+          "objectType": "Table",
+          "schema": "public",
+          "name": "table1",
+          "qualifiedName": "public.table1"
+        },
+        "sourceDefinition": "CREATE TABLE dbo.Table1(Id int, password=***)",
+        "postgreSqlDefinition": "CREATE TABLE public.table1(id integer);",
+        "classification": 1,
+        "ruleId": "REPORT.TEST",
+        "confidence": 0.9,
+        "findings": [
+          {
+            "code": "REPORT.TEST",
+            "severity": 1,
+            "message": "Representative warning.",
+            "objectId": {
+              "value": "728ea536-1781-5ae6-96ac-553d3753d348"
+            },
+            "evidence": null,
+            "remediation": null
+          }
+        ],
+        "dependencies": [],
+        "referencedTargetObjects": [],
+        "requiredExtensions": [],
+        "requiresManualReview": true,
+        "unsupportedConstructs": [
+          "Fixture"
+        ],
+        "validation": {
+          "isStructurallyValid": true,
+          "wasLiveValidated": false,
+          "sqlState": null,
+          "message": null,
+          "errorPosition": null
+        },
+        "deploymentPhase": 5,
+        "scriptFileName": "05_Tables.sql",
+        "contentHash": "artifact-hash"
+      }
+    ],
+    "findings": [
+      {
+        "code": "REPORT.TEST",
+        "severity": 1,
+        "message": "Representative warning.",
+        "objectId": {
+          "value": "728ea536-1781-5ae6-96ac-553d3753d348"
+        },
+        "evidence": null,
+        "remediation": null
+      }
+    ],
+    "requiredExtensions": [
+      "pgcrypto"
+    ],
+    "engineVersion": "test",
+    "requiresManualReview": true
+  },
+  "dataMigration": {
+    "runId": "c3b20984-db7c-4ec1-a810-650a207f9924",
+    "state": 4,
+    "startedAt": "2026-07-24T10:39:02.1953403+00:00",
+    "completedAt": "2026-07-24T10:41:02.1953403+00:00",
+    "tables": [
+      {
+        "tableId": {
+          "value": "728ea536-1781-5ae6-96ac-553d3753d348"
+        },
+        "table": "dbo.Table1",
+        "state": 4,
+        "rowsRead": 10,
+        "rowsWritten": 9,
+        "rowsRejected": 1,
+        "bytesTransferred": 1024,
+        "readDuration": "00:00:01",
+        "writeDuration": "00:00:01",
+        "validationDuration": "00:00:00.2000000",
+        "totalDuration": "00:00:02",
+        "retryCount": 0,
+        "failureCount": 1,
+        "effectiveParallelism": 1,
+        "peakManagedMemoryBytes": 1000000,
+        "rowsPerSecond": 4.5,
+        "bytesPerSecond": 512,
+        "message": "Sanitized fixture"
+      }
+    ],
+    "failures": [
+      {
+        "table": "dbo.Table1",
+        "batch": 1,
+        "rowOrdinal": 10,
+        "safeSourceKey": "key-hash",
+        "targetColumn": "password",
+        "sourceDataType": "nvarchar",
+        "targetDataType": "text",
+        "sqlState": "22000",
+        "sanitizedMessage": "Sensitive value rejected and redacted.",
+        "retryCount": 0,
+        "category": 3,
+        "disposition": 1
+      }
+    ],
+    "validations": [],
+    "sequenceResets": [],
+    "checkpointPath": "checkpoint.json",
+    "effectiveTableParallelism": 1,
+    "peakReaderConnections": 1,
+    "peakWriterConnections": 1,
+    "warnings": []
+  },
+  "deployment": {
+    "deploymentId": "a574b4e6-3989-4e5c-b9b6-ee821374852a",
+    "status": 4,
+    "startedAt": "2026-07-24T10:40:02.1953403+00:00",
+    "completedAt": "2026-07-24T10:41:02.1953403+00:00",
+    "targetDatabase": "SanitizedTarget",
+    "journalPath": "journal.json",
+    "objects": [
+      {
+        "sourceObjectId": {
+          "value": "728ea536-1781-5ae6-96ac-553d3753d348"
+        },
+        "targetObject": "public.table1",
+        "phase": 5,
+        "scriptFile": "05_Tables.sql",
+        "executedSqlHash": "sql-hash",
+        "status": 2,
+        "commitStatus": 2,
+        "startedAt": "2026-07-24T10:40:32.1953403+00:00",
+        "endedAt": "2026-07-24T10:41:02.1953403+00:00",
+        "dependencies": [],
+        "retries": [],
+        "failure": null,
+        "isIdempotent": true,
+        "message": "Created"
+      }
+    ],
+    "failures": [],
+    "dataMigrationRunId": "c3b20984-db7c-4ec1-a810-650a207f9924",
+    "findings": []
+  },
+  "validation": {
+    "runId": "4c6b23b8-5da8-40bb-8ad8-4ddacaf5461c",
+    "migrationRunId": "c3b20984-db7c-4ec1-a810-650a207f9924",
+    "deploymentRunId": "a574b4e6-3989-4e5c-b9b6-ee821374852a",
+    "sourceSnapshotHash": "snapshot-hash",
+    "targetDatabaseIdentity": "SanitizedTarget@localhost",
+    "configuration": {
+      "level": 6,
+      "scope": {
+        "schemas": [],
+        "objectTypes": [],
+        "tables": []
+      },
+      "canonical": {
+        "floatingPointAbsoluteTolerance": 1E-09,
+        "floatingPointRelativeTolerance": 1E-12,
+        "decimalScale": null,
+        "timePrecision": 6,
+        "trimFixedWidthTrailingSpaces": true,
+        "caseInsensitiveStrings": false,
+        "normalizeJsonPropertyOrder": false,
+        "normalizeXml": false,
+        "normalizeTimestampsToUtc": true
+      },
+      "keylessTableStrategy": 3,
+      "sampleSize": 1000,
+      "chunkSize": 10000,
+      "validateForeignKeyOrphans": true,
+      "includeDistinctCounts": false,
+      "includeColumnAggregates": true,
+      "customQueries": [],
+      "routineTestCases": [],
+      "categoryWeights": {
+        "StructuralCompleteness": 25,
+        "DataReconciliation": 25,
+        "Constraints": 15,
+        "ProgrammableObjects": 15,
+        "Security": 5,
+        "UnsupportedFeatures": 5,
+        "ManualReviewCompletion": 10
+      },
+      "severityOverrides": {}
+    },
+    "startedAt": "2026-07-24T10:40:42.1953403+00:00",
+    "completedAt": "2026-07-24T10:41:02.1953403+00:00",
+    "objectComparisons": [],
+    "dataComparisons": [
+      {
+        "sourceTable": "dbo.Table1",
+        "targetTable": "public.table1",
+        "sourceRowCount": 10,
+        "targetRowCount": 9,
+        "sourceChecksum": "source-hash",
+        "targetChecksum": "target-hash",
+        "isOrderedChecksum": true,
+        "sourceMetrics": [],
+        "targetMetrics": [],
+        "classification": 3,
+        "detail": "Counts differ."
+      }
+    ],
+    "sequenceResults": [],
+    "findings": [
+      {
+        "ruleId": "DATA.ROW_COUNT",
+        "category": 1,
+        "severity": 3,
+        "classification": 3,
+        "objectType": "Table",
+        "sourceObject": "dbo.Table1",
+        "targetObject": "public.table1",
+        "summary": "Row counts differ; values were not retained.",
+        "sourceDefinition": null,
+        "targetDefinition": null,
+        "isSensitive": false,
+        "isOverridden": false,
+        "overrideReason": null
+      }
+    ],
+    "queriesExecuted": [],
+    "readiness": {
+      "overallStatus": 2,
+      "weightedScore": 75.0,
+      "categories": [
+        {
+          "category": 0,
+          "weight": 25,
+          "applicableChecks": 0,
+          "passedChecks": 0,
+          "warningChecks": 0,
+          "blockerChecks": 0,
+          "score": 100,
+          "status": 0,
+          "explanation": "No applicable source objects were present; the category completed without findings."
+        },
+        {
+          "category": 1,
+          "weight": 25,
+          "applicableChecks": 1,
+          "passedChecks": 0,
+          "warningChecks": 0,
+          "blockerChecks": 1,
+          "score": 0.0,
+          "status": 2,
+          "explanation": "0 passed, 0 warnings, and 1 blockers across 1 checks."
+        },
+        {
+          "category": 2,
+          "weight": 15,
+          "applicableChecks": 0,
+          "passedChecks": 0,
+          "warningChecks": 0,
+          "blockerChecks": 0,
+          "score": 100,
+          "status": 0,
+          "explanation": "No applicable source objects were present; the category completed without findings."
+        },
+        {
+          "category": 3,
+          "weight": 15,
+          "applicableChecks": 0,
+          "passedChecks": 0,
+          "warningChecks": 0,
+          "blockerChecks": 0,
+          "score": 100,
+          "status": 0,
+          "explanation": "No applicable source objects were present; the category completed without findings."
+        },
+        {
+          "category": 4,
+          "weight": 5,
+          "applicableChecks": 0,
+          "passedChecks": 0,
+          "warningChecks": 0,
+          "blockerChecks": 0,
+          "score": 100,
+          "status": 0,
+          "explanation": "No applicable source objects were present; the category completed without findings."
+        },
+        {
+          "category": 5,
+          "weight": 5,
+          "applicableChecks": 0,
+          "passedChecks": 0,
+          "warningChecks": 0,
+          "blockerChecks": 0,
+          "score": 100,
+          "status": 0,
+          "explanation": "No applicable source objects were present; the category completed without findings."
+        },
+        {
+          "category": 6,
+          "weight": 10,
+          "applicableChecks": 0,
+          "passedChecks": 0,
+          "warningChecks": 0,
+          "blockerChecks": 0,
+          "score": 100,
+          "status": 0,
+          "explanation": "No applicable source objects were present; the category completed without findings."
+        }
+      ],
+      "criticalBlockers": [
+        {
+          "ruleId": "DATA.ROW_COUNT",
+          "category": 1,
+          "severity": 3,
+          "classification": 3,
+          "objectType": "Table",
+          "sourceObject": "dbo.Table1",
+          "targetObject": "public.table1",
+          "summary": "Row counts differ; values were not retained.",
+          "sourceDefinition": null,
+          "targetDefinition": null,
+          "isSensitive": false,
+          "isOverridden": false,
+          "overrideReason": null
+        }
+      ],
+      "explanation": "1 critical blocker(s) prevent readiness regardless of the weighted score."
+    }
+  },
+  "manualReviews": [
+    {
+      "id": "771b0501-7570-40d3-a954-557f57689b7e",
+      "findingKey": "conversion:artifact-hash",
+      "source": "public.table1",
+      "title": "Review representative conversion",
+      "description": "Fixture manual review.",
+      "owner": null,
+      "status": 0,
+      "comments": null,
+      "resolution": null,
+      "targetSql": "ALTER ROLE app PASSWORD=***;",
+      "createdAt": "2026-07-24T10:41:02.1953403+00:00",
+      "updatedAt": "2026-07-24T10:41:02.1953403+00:00",
+      "reviewedAt": null,
+      "reviewedBy": null,
+      "isCriticalBlocker": true
+    }
+  ],
+  "template": {
+    "templateId": "professional-light",
+    "organizationName": "Example Organization",
+    "logoPath": null,
+    "projectName": "Sanitized Migration",
+    "reportTitle": "Migration Executive Summary",
+    "preparedBy": "Migration Team",
+    "reviewedBy": "Database Owner",
+    "classificationMarking": "Internal",
+    "footer": "Generated by SQL Server to PostgreSQL Migration Studio",
+    "dateTimeFormat": "yyyy-MM-dd HH:mm:ss zzz",
+    "useDarkDashboardTheme": false
+  }
+}

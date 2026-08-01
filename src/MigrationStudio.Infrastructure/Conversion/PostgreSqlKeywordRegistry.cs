@@ -1,0 +1,54 @@
+using System.Collections.Frozen;
+using MigrationStudio.Domain.Conversion;
+
+namespace MigrationStudio.Infrastructure.Conversion;
+
+internal static class PostgreSqlKeywordRegistry
+{
+    private static readonly string[] CommonRestrictedKeywords =
+    [
+        "all", "analyse", "analyze", "and", "any", "array", "as", "asc", "asymmetric",
+        "authorization", "between", "bigint", "binary", "bit", "boolean", "both", "case",
+        "cast", "char", "character", "check", "coalesce", "collate", "collation", "column",
+        "concurrently", "constraint", "create", "cross", "current_catalog", "current_date",
+        "current_role", "current_schema", "current_time", "current_timestamp", "current_user",
+        "dec", "decimal", "default", "deferrable", "desc", "distinct", "do", "else", "end",
+        "except", "exists", "extract", "false", "fetch", "float", "for", "foreign", "freeze",
+        "from", "full", "grant", "greatest", "group", "grouping", "having", "ilike", "in",
+        "initially", "inner", "inout", "int", "integer", "intersect", "interval", "into", "is",
+        "isnull", "join", "json", "json_array", "json_arrayagg", "json_exists", "json_object",
+        "json_objectagg", "json_query", "json_scalar", "json_serialize", "json_table",
+        "json_value", "lateral", "leading", "least", "left", "like", "limit", "localtime",
+        "localtimestamp", "merge", "national", "natural", "nchar", "none", "normalize", "not",
+        "notnull", "null", "nullif", "numeric", "offset", "on", "only", "or", "order", "out",
+        "outer", "overlaps", "overlay", "placing", "position", "precision", "primary", "real",
+        "references", "returning", "right", "row", "select", "session_user", "setof", "similar",
+        "smallint", "some", "substring", "symmetric", "system_user", "table", "tablesample",
+        "then", "time", "timestamp", "to", "trailing", "treat", "trim", "true", "union",
+        "unique", "user", "using", "values", "varchar", "variadic", "verbose", "when", "where",
+        "window", "with", "xmlattributes", "xmlconcat", "xmlelement", "xmlexists",
+        "xmlforest", "xmlnamespaces", "xmlparse", "xmlpi", "xmlroot", "xmlserialize",
+        "xmltable"
+    ];
+
+    private static readonly FrozenDictionary<int, FrozenSet<string>> KeywordsByMajor =
+        new Dictionary<int, FrozenSet<string>>
+        {
+            [14] = Build(),
+            [15] = Build("merge"),
+            [16] = Build("merge"),
+            [17] = Build("merge", "json", "json_table"),
+            [18] = Build("merge", "json", "json_table")
+        }.ToFrozenDictionary();
+
+    public static bool IsRestricted(PostgreSqlVersion version, string identifier)
+    {
+        version.Validate();
+        return KeywordsByMajor[version.Major].Contains(identifier);
+    }
+
+    private static FrozenSet<string> Build(params string[] additions) =>
+        CommonRestrictedKeywords
+            .Concat(additions)
+            .ToFrozenSet(StringComparer.OrdinalIgnoreCase);
+}

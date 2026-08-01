@@ -1,0 +1,2 @@
+﻿"SourceTable","TargetTable","SourceRows","TargetRows","Classification","OrderedChecksum","Detail"
+"dbo.Table1","public.table1","10","9","Mismatch","True","Counts differ."

@@ -1,0 +1,43 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <SolidColorBrush x:Key="WindowBackgroundBrush" Color="#FF151A22" />
+    <SolidColorBrush x:Key="ContentBackgroundBrush" Color="#FF202733" />
+    <SolidColorBrush x:Key="PanelBackgroundBrush" Color="#FF1A202A" />
+    <SolidColorBrush x:Key="RibbonBackgroundBrush" Color="#FF202733" />
+    <SolidColorBrush x:Key="BorderBrush" Color="#FF384252" />
+    <SolidColorBrush x:Key="SplitterBrush" Color="#FF303948" />
+    <SolidColorBrush x:Key="PrimaryTextBrush" Color="#FFF1F5F9" />
+    <SolidColorBrush x:Key="SecondaryTextBrush" Color="#FFB0BAC8" />
+    <SolidColorBrush x:Key="AccentBrush" Color="#FF60A5FA" />
+    <SolidColorBrush x:Key="StatusBarBackgroundBrush" Color="#FF102A43" />
+    <SolidColorBrush x:Key="StatusBarForegroundBrush" Color="#FFFFFFFF" />
+
+    <Style TargetType="{x:Type Window}">
+        <Setter Property="Foreground" Value="{DynamicResource PrimaryTextBrush}" />
+        <Setter Property="FontFamily" Value="Segoe UI" />
+        <Setter Property="FontSize" Value="13" />
+    </Style>
+    <Style TargetType="{x:Type Button}">
+        <Setter Property="Padding" Value="10,6" />
+        <Setter Property="MinHeight" Value="32" />
+        <Setter Property="Foreground" Value="{DynamicResource PrimaryTextBrush}" />
+        <Setter Property="Background" Value="#FF2A3442" />
+        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
+    </Style>
+    <Style TargetType="{x:Type TextBlock}">
+        <Setter Property="Foreground" Value="{DynamicResource PrimaryTextBrush}" />
+    </Style>
+    <Style TargetType="{x:Type TabControl}">
+        <Setter Property="Foreground" Value="{DynamicResource PrimaryTextBrush}" />
+    </Style>
+    <Style TargetType="{x:Type TabItem}">
+        <Setter Property="Foreground" Value="{DynamicResource PrimaryTextBrush}" />
+        <Setter Property="Background" Value="{DynamicResource RibbonBackgroundBrush}" />
+    </Style>
+    <Style TargetType="{x:Type DataGrid}">
+        <Setter Property="Foreground" Value="{DynamicResource PrimaryTextBrush}" />
+        <Setter Property="Background" Value="{DynamicResource PanelBackgroundBrush}" />
+        <Setter Property="RowBackground" Value="{DynamicResource PanelBackgroundBrush}" />
+        <Setter Property="AlternatingRowBackground" Value="#FF242D3A" />
+    </Style>
+</ResourceDictionary>

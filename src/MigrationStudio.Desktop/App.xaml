@@ -1,0 +1,37 @@
+<Application x:Class="MigrationStudio.Desktop.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:viewModels="clr-namespace:MigrationStudio.Desktop.ViewModels"
+             xmlns:views="clr-namespace:MigrationStudio.Desktop.Views"
+             xmlns:converters="clr-namespace:MigrationStudio.Desktop.Converters"
+             ShutdownMode="OnMainWindowClose">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ResourceDictionary Source="Themes/LightTheme.xaml" />
+            </ResourceDictionary.MergedDictionaries>
+
+            <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter" />
+            <converters:InverseBooleanConverter x:Key="InverseBooleanConverter" />
+
+            <DataTemplate DataType="{x:Type viewModels:HomeViewModel}">
+                <views:HomeView />
+            </DataTemplate>
+            <DataTemplate DataType="{x:Type viewModels:WorkspaceViewModel}">
+                <views:WorkspaceView />
+            </DataTemplate>
+            <DataTemplate DataType="{x:Type viewModels:MigrationWizardViewModel}">
+                <views:MigrationWizardView />
+            </DataTemplate>
+            <DataTemplate DataType="{x:Type viewModels:ReportsViewModel}">
+                <views:ReportsView />
+            </DataTemplate>
+            <DataTemplate DataType="{x:Type viewModels:PluginsViewModel}">
+                <views:PluginsView />
+            </DataTemplate>
+            <DataTemplate DataType="{x:Type viewModels:SettingsViewModel}">
+                <views:SettingsView />
+            </DataTemplate>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>
