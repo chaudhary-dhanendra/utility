@@ -1,4 +1,5 @@
 using System.IO;
+using System.Text.Json;
 using ClosedXML.Excel;
 using ClosedXML.Graphics;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -76,6 +77,51 @@ public sealed class ConversionEngineTests
 
         Assert.Contains("identifier mapping is incomplete", exception.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Contains(missingColumn.Name, exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Engine_TrimsTrailingIndexIncludesToPostgreSqlColumnLimit()
+    {
+        var inventory = CreateInventory();
+        var table = Assert.Single(inventory.Objects, item => item.ObjectType == InventoryObjectType.Table);
+        var index = Assert.Single(inventory.Indexes);
+        var extraColumns = Enumerable.Range(4, 36)
+            .Select(ordinal => Column(
+                table,
+                ordinal,
+                $"Include{ordinal}",
+                "int",
+                true,
+                false,
+                null,
+                null,
+                null))
+            .ToArray();
+        var oversized = index with
+        {
+            Columns =
+            [
+                new IndexColumn(1, "Name", false, false),
+                .. extraColumns.Select(item => new IndexColumn(0, item.Name, false, true))
+            ]
+        };
+        inventory = inventory with
+        {
+            Columns = [.. inventory.Columns, .. extraColumns],
+            Indexes = [oversized]
+        };
+
+        var run = await CreateEngine().ConvertAsync(
+            inventory,
+            new ConversionOptions(),
+            null,
+            CancellationToken.None);
+
+        var artifact = Assert.Single(run.Artifacts, item => item.SourceObjectId == index.ObjectId);
+        Assert.Equal(ConversionClassification.AutomaticWithWarning, artifact.Classification);
+        Assert.Contains("INCLUDE", artifact.PostgreSqlDefinition, StringComparison.Ordinal);
+        Assert.Contains("include34", artifact.PostgreSqlDefinition, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("include35", artifact.PostgreSqlDefinition, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -582,6 +628,75 @@ public sealed class ConversionEngineTests
     }
 
     [Fact]
+    public async Task NonImmutableComputedColumnsUseOrderedCompatibilityTrigger()
+    {
+        var table = Object(InventoryObjectType.Table, "dbo", "ComputedCompat", 701, null);
+        var routine = Object(
+            InventoryObjectType.Function,
+            "dbo",
+            "FiscalYearCompat",
+            702,
+            null,
+            "CREATE FUNCTION dbo.FiscalYearCompat(@value datetime) RETURNS varchar(10) AS BEGIN RETURN 'x' END");
+        var inventory = TestInventory.CreateSnapshot([table, routine]) with
+        {
+            Tables =
+            [
+                new TableInventory(
+                    table.Id, TableKind.Ordinary, false, null, false, 0, null, false, false,
+                    false, false, false, false, false, 0, 0, 0, [])
+            ],
+            Columns =
+            [
+                Column(table, 1, "Id", "int", false, false, null, null, null),
+                Column(table, 2, "Created", "datetime", true, false, null, null, null, 8),
+                Column(table, 3, "GeneratedId", "bigint", true, false, null, null, null, 8,
+                    true, "CONVERT(bigint, CONVERT(varchar, [Id]) + CONVERT(varchar, RAND([Id]) * 1000000))", true),
+                Column(table, 4, "CurrentYear", "varchar", true, false, null, null, null, 10,
+                    true, "dbo.FiscalYearCompat(GETDATE())", false),
+                Column(table, 5, "ImmutableValue", "int", true, false, null, null, null, 4,
+                    true, "[Id] + 1", true)
+            ],
+            Modules =
+            [
+                new ModuleInventory(
+                    routine.Id, ModuleKind.ScalarFunction, true, true, false, false, false,
+                    false, null, false, false, false, false,
+                    [
+                        new ModuleParameterInventory(0, string.Empty, "sys", "varchar", 10, 0, 0, false, false, null, false, false),
+                        new ModuleParameterInventory(1, "@value", "sys", "datetime", 8, 0, 3, false, false, null, false, false)
+                    ],
+                    [])
+            ],
+            Dependencies =
+            [
+                new InventoryDependency(table.Id, routine.Id, DependencyKind.SqlExpression, routine.QualifiedSourceName, true, false)
+            ]
+        };
+
+        var run = await CreateEngine().ConvertAsync(
+            inventory,
+            new ConversionOptions(),
+            null,
+            CancellationToken.None);
+        var tableArtifact = Assert.Single(run.Artifacts, item => item.SourceObjectId == table.Id);
+        var routineArtifact = Assert.Single(run.Artifacts, item => item.SourceObjectId == routine.Id);
+
+        Assert.False(tableArtifact.RequiresManualReview);
+        Assert.Contains("GeneratedId bigint", tableArtifact.PostgreSqlDefinition, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("GeneratedId bigint GENERATED ALWAYS", tableArtifact.PostgreSqlDefinition, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("ImmutableValue integer GENERATED ALWAYS", tableArtifact.PostgreSqlDefinition, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("RETURNS trigger", tableArtifact.PostgreSqlDefinition, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("NEW.generatedid :=", tableArtifact.PostgreSqlDefinition, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("random()", tableArtifact.PostgreSqlDefinition, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("NEW.id", tableArtifact.PostgreSqlDefinition, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("BEFORE INSERT OR UPDATE", tableArtifact.PostgreSqlDefinition, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("UPDATE OF id", tableArtifact.PostgreSqlDefinition, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(routine.Id, tableArtifact.Dependencies);
+        Assert.True(run.Artifacts.ToList().IndexOf(routineArtifact) < run.Artifacts.ToList().IndexOf(tableArtifact));
+    }
+
+    [Fact]
     public async Task PackageWriter_EmitsManifestScriptsManualReviewAndExcelHtmlReports()
     {
         var run = await CreateEngine().ConvertAsync(
@@ -602,6 +717,24 @@ public sealed class ConversionEngineTests
             Assert.True(File.Exists(Path.Combine(package, "Reports", "Conversion_Report.xlsx")));
             Assert.True(File.Exists(Path.Combine(package, "Reports", "Conversion_Report.html")));
             Assert.True(File.Exists(Path.Combine(package, "Reports", "Identifier_Mapping.csv")));
+            Assert.True(File.Exists(Path.Combine(package, "Reports", "manual-review-report.json")));
+            Assert.True(File.Exists(Path.Combine(package, "Reports", "manual-review-report.csv")));
+            Assert.True(File.Exists(Path.Combine(package, "Reports", "manual-review-report.html")));
+            Assert.True(File.Exists(Path.Combine(package, "Reports", "manual-review-summary.json")));
+            Assert.True(File.Exists(Path.Combine(package, "Reports", "conversion-summary.json")));
+            Assert.True(File.Exists(Path.Combine(package, "Reports", "conversion-summary.html")));
+            Assert.True(File.Exists(Path.Combine(package, "Reports", "artifact-validation.csv")));
+            using (var reviewJson = JsonDocument.Parse(await File.ReadAllTextAsync(
+                       Path.Combine(package, "Reports", "manual-review-report.json"))))
+            {
+                var items = reviewJson.RootElement.EnumerateArray().ToArray();
+                Assert.NotEmpty(items);
+                var item = items[0];
+                Assert.False(string.IsNullOrWhiteSpace(item.GetProperty("FindingId").GetString()));
+                Assert.False(string.IsNullOrWhiteSpace(item.GetProperty("SourceDefinitionHash").GetString()));
+                Assert.True(item.GetProperty("UnrelatedDeploymentMayContinue").GetBoolean());
+                Assert.False(string.IsNullOrWhiteSpace(item.GetProperty("CompatibilityStubStatus").GetString()));
+            }
             Assert.NotEmpty(Directory.GetFiles(Path.Combine(package, "ManualReview"), "*.sql"));
         }
         finally
@@ -877,14 +1010,16 @@ public sealed class ConversionEngineTests
         string? increment,
         short length = 4,
         bool computed = false,
-        string? computedDefinition = null) =>
+        string? computedDefinition = null,
+        bool? computedDeterministic = null) =>
         new(
             InventoryObjectId.Create("fixture", InventoryObjectType.Column, table.SourceSchema, name, ordinal, table.Id),
             table.Id, ordinal, ordinal, name, type, type, "sys", length, 18, 0, null, nullable,
             identity,
             seed is null ? null : decimal.Parse(seed, System.Globalization.CultureInfo.InvariantCulture),
             increment is null ? null : decimal.Parse(increment, System.Globalization.CultureInfo.InvariantCulture),
-            null, false, computed, computedDefinition, computed, computed ? true : null, false, false,
+            null, false, computed, computedDefinition, computed,
+            computed ? computedDeterministic ?? true : null, false, false,
             false, false, 0, false, false, null, null, null, null, null, null, defaultDefinition,
             null, []);
 }

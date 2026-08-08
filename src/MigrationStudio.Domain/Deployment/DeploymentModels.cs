@@ -356,6 +356,10 @@ public sealed record MigrationPackageManifest
 
     public IReadOnlyList<string> UnsupportedFeatures { get; init; } = [];
 
+    public Guid? DeploymentPlanId { get; init; }
+
+    public BlockedDependencyReconciliation? BlockedDependencyReconciliation { get; init; }
+
     public string SecurityClassification { get; init; } = "Contains schema metadata; no row values";
 }
 

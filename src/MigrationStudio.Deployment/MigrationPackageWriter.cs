@@ -34,6 +34,25 @@ public sealed class MigrationPackageWriter(IConversionReportWriter reportWriter)
             run.Artifacts,
             run.Artifacts,
             "package input validation");
+        var publicationPlanning = run.PublicationReconciliation is null
+            ? null
+            : DeploymentPublicationReconciler.Reconcile(run);
+        if (publicationPlanning is not null && !publicationPlanning.Reconciliation.CanPublish)
+        {
+            throw new InvalidDataException(
+                "Package publication was refused by dependency reconciliation: " +
+                $"failed={publicationPlanning.Reconciliation.DirectValidationFailureCount:N0}, " +
+                $"hard-blocked={publicationPlanning.Reconciliation.HardBlockedCount:N0}, " +
+                $"not-run={publicationPlanning.Reconciliation.NotRunExecutableCount:N0}, " +
+                $"hard-cycles={publicationPlanning.Reconciliation.HardCycleCount:N0}, " +
+                $"unresolved={publicationPlanning.Reconciliation.UnresolvedInternalDependencyCount:N0}.");
+        }
+        if (publicationPlanning is not null &&
+            run.PublicationReconciliation!.DeploymentPlanId != publicationPlanning.Plan.PlanId)
+        {
+            throw new InvalidDataException(
+                "Package publication was refused because the reconciled deployment plan changed.");
+        }
         var structurallyInvalid = run.Artifacts.FirstOrDefault(item =>
             !item.RequiresManualReview &&
             item.Classification is ConversionClassification.Automatic or
@@ -47,15 +66,24 @@ public sealed class MigrationPackageWriter(IConversionReportWriter reportWriter)
                 $"{structurallyInvalid.TargetObjectId.QualifiedName}. " +
                 $"{structurallyInvalid.Validation.Message ?? "No validation detail was supplied."}");
         }
-        var orderedArtifacts = ArtifactDependencyPlanner.Order(
-            run.Artifacts,
-            item => item.SourceObjectId,
-            item => item.Dependencies,
-            item => DeploymentPhaseOrdering.GetRank(
-                item.DeploymentPhase,
-                item.TargetObjectId.ObjectType),
-            item => $"{item.TargetObjectId.QualifiedName}|{item.ContentHash}",
-            failOnCycle: true);
+        var orderedArtifacts = publicationPlanning is null
+            ? ArtifactDependencyPlanner.Order(
+                run.Artifacts,
+                item => item.SourceObjectId,
+                item => item.Dependencies,
+                item => DeploymentPhaseOrdering.GetRank(
+                    item.DeploymentPhase,
+                    item.TargetObjectId.ObjectType),
+                item => $"{item.TargetObjectId.QualifiedName}|{item.ContentHash}",
+                failOnCycle: true)
+            : DeploymentPublicationReconciler.OrderForPackage(run, publicationPlanning);
+        var deferredIdentities = publicationPlanning?.Reconciliation.ArtifactDecisions
+            .Where(item => item.ReconciledClassification ==
+                           ReconciledBlockedClassification.DeferredByDeploymentPlan)
+            .Select(item => $"{item.SourceObjectId}|{item.TargetQualifiedName}")
+            .ToHashSet(StringComparer.Ordinal) ?? [];
+        bool IsDeferredArtifact(ConversionArtifact item) => deferredIdentities.Contains(
+            $"{item.SourceObjectId}|{item.TargetObjectId.QualifiedName}");
 
         var packageName = $"Migration_{run.GeneratedAt:yyyyMMdd_HHmmss}_{run.RunId:N}";
         var finalPackageDirectory = Path.Combine(Path.GetFullPath(parentDirectory), packageName);
@@ -113,6 +141,7 @@ public sealed class MigrationPackageWriter(IConversionReportWriter reportWriter)
         const string executionPlanName = "00_ExecutionPlan.sql";
         var executionPlanArtifacts = orderedArtifacts
             .Where(item => !item.RequiresManualReview && ContainsExecutableSql(item.PostgreSqlDefinition))
+            .Where(item => !IsDeferredArtifact(item))
             .ToArray();
         await File.WriteAllTextAsync(
             Path.Combine(packageDirectory, executionPlanName),
@@ -177,6 +206,20 @@ public sealed class MigrationPackageWriter(IConversionReportWriter reportWriter)
             Report("Generating conversion reports; report writer is responsive.", "Reports");
         }
         await reportTask.ConfigureAwait(false);
+        if (publicationPlanning is not null)
+        {
+            var completedWithWarnings = run.RequiresManualReview ||
+                                        publicationPlanning.Reconciliation.HasWarnings;
+            await PackagePublicationReconciliationDiagnosticsWriter.WriteAsync(
+                    publicationPlanning.Reconciliation,
+                    Path.Combine(packageDirectory, "Reports"),
+                    orderedArtifacts.Count,
+                    executionPlanArtifacts.Length,
+                    completedWithWarnings ? "CompletedWithWarnings" : "Completed",
+                    nextDeployEnabled: true,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
         packageWorkCompleted++;
         Report("Conversion reports generated.");
 
@@ -240,6 +283,8 @@ public sealed class MigrationPackageWriter(IConversionReportWriter reportWriter)
                 .Distinct(StringComparer.Ordinal)
                 .Order(StringComparer.Ordinal)
                 .ToArray(),
+            DeploymentPlanId = publicationPlanning?.Plan.PlanId,
+            BlockedDependencyReconciliation = publicationPlanning?.Reconciliation,
             Artifacts = orderedArtifacts.Select(item => new PackageArtifactManifest(
                 item.SourceObjectId,
                 item.TargetObjectId.ObjectType,
@@ -248,7 +293,7 @@ public sealed class MigrationPackageWriter(IConversionReportWriter reportWriter)
                 item.DeploymentPhase,
                 item.ScriptFileName,
                 item.PostgreSqlDefinition,
-                HashText(item.PostgreSqlDefinition),
+                item.ContentHash,
                 item.Classification,
                 item.Dependencies,
                 item.RequiredExtensions,
@@ -263,16 +308,20 @@ public sealed class MigrationPackageWriter(IConversionReportWriter reportWriter)
                     RoutineIdentityArguments = ExtractRoutineIdentityArguments(
                         item.TargetObjectId.ObjectType,
                         item.PostgreSqlDefinition),
-                    IsExecutable = ConversionArtifactReconciler.IsDeployableExecutable(item),
+                    IsExecutable = ConversionArtifactReconciler.IsDeployableExecutable(item) &&
+                                   !IsDeferredArtifact(item),
                     LiveValidation = item.Validation
                 })
                 .ToArray()
         };
         EnsureManifestReconciles(run, manifest);
-        ArtifactDependencyPlanner.EnsureDependenciesPrecedeDependents(
-            manifest.Artifacts,
-            item => item.SourceObjectId,
-            item => item.Dependencies);
+        if (publicationPlanning is null)
+        {
+            ArtifactDependencyPlanner.EnsureDependenciesPrecedeDependents(
+                manifest.Artifacts,
+                item => item.SourceObjectId,
+                item => item.Dependencies);
+        }
         await using (var manifestStream = new FileStream(
                          Path.Combine(packageDirectory, "manifest.json"),
                          FileMode.CreateNew,

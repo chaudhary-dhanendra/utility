@@ -163,8 +163,15 @@ public sealed record ExpressionTranslationContext(
     public IReadOnlyDictionary<string, string> TargetColumnTypes { get; init; } =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
+    public IReadOnlyDictionary<string, TargetRoutineSignature> TargetRoutineSignatures { get; init; } =
+        new Dictionary<string, TargetRoutineSignature>(StringComparer.OrdinalIgnoreCase);
+
     public string? ExpectedTargetType { get; init; }
 }
+
+public sealed record TargetRoutineSignature(
+    IReadOnlyList<string> ParameterTypes,
+    string? ReturnType);
 
 public sealed record ExpressionTranslationResult(
     string Sql,

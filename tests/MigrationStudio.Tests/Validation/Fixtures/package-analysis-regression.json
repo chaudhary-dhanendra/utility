@@ -1,0 +1,88 @@
+{
+  "Artifacts": [
+    {
+      "SourceObjectId": "root-timestamp",
+      "TargetObjectId": { "ObjectType": "Table", "Schema": "public", "Name": "timestamp_default" },
+      "SourceDefinition": "CREATE TABLE dbo.timestamp_default(created datetime DEFAULT '')",
+      "PostgreSqlDefinition": "CREATE TABLE public.timestamp_default(created timestamp DEFAULT '');",
+      "RuleId": "TABLE.STRUCTURED", "DeploymentPhase": "Tables", "RequiresManualReview": false,
+      "Dependencies": [],
+      "Validation": { "Outcome": "Failed", "SqlState": "22007", "Message": "invalid input syntax for type timestamp: redacted", "BlockingDependencies": [] }
+    },
+    {
+      "SourceObjectId": "root-bigint",
+      "TargetObjectId": { "ObjectType": "Table", "Schema": "public", "Name": "bigint_default" },
+      "SourceDefinition": "CREATE TABLE dbo.bigint_default(id bigint DEFAULT '')",
+      "PostgreSqlDefinition": "CREATE TABLE public.bigint_default(id bigint DEFAULT '');",
+      "RuleId": "TABLE.STRUCTURED", "DeploymentPhase": "Tables", "RequiresManualReview": false,
+      "Dependencies": [],
+      "Validation": { "Outcome": "Failed", "SqlState": "22P02", "Message": "invalid input syntax for type bigint: redacted", "BlockingDependencies": [] }
+    },
+    {
+      "SourceObjectId": "root-on", "TargetObjectId": { "ObjectType": "StoredProcedure", "Schema": "public", "Name": "near_on" },
+      "SourceDefinition": "CREATE PROC dbo.near_on AS SET NOCOUNT ON", "PostgreSqlDefinition": "CREATE PROCEDURE public.near_on() LANGUAGE plpgsql AS $$ BEGIN SET NOCOUNT ON; END; $$;",
+      "RuleId": "PROCEDURE.PLPGSQL", "DeploymentPhase": "Procedures", "RequiresManualReview": false, "Dependencies": [],
+      "Validation": { "Outcome": "Failed", "SqlState": "42601", "Message": "syntax error at or near ON", "BlockingDependencies": [] }
+    },
+    {
+      "SourceObjectId": "root-then", "TargetObjectId": { "ObjectType": "Function", "Schema": "public", "Name": "missing_then" },
+      "SourceDefinition": "IF @x = 1 RETURN 1", "PostgreSqlDefinition": "CREATE FUNCTION public.missing_then() RETURNS int LANGUAGE plpgsql AS $$ BEGIN IF x = 1 RETURN 1; END IF; END; $$;",
+      "RuleId": "FUNCTION.SCALAR.PLPGSQL", "DeploymentPhase": "Functions", "RequiresManualReview": false, "Dependencies": [],
+      "Validation": { "Outcome": "Failed", "SqlState": "42601", "Message": "missing THEN at end of SQL expression", "BlockingDependencies": [] }
+    },
+    {
+      "SourceObjectId": "root-assignment", "TargetObjectId": { "ObjectType": "StoredProcedure", "Schema": "public", "Name": "bad_assignment" },
+      "SourceDefinition": "SET @x = 1", "PostgreSqlDefinition": "CREATE PROCEDURE public.bad_assignment() LANGUAGE plpgsql AS $$ BEGIN SET v_x := 1; END; $$;",
+      "RuleId": "PROCEDURE.PLPGSQL", "DeploymentPhase": "Procedures", "RequiresManualReview": false, "Dependencies": [],
+      "Validation": { "Outcome": "Failed", "SqlState": "42601", "Message": "syntax error at or near :=", "BlockingDependencies": [] }
+    },
+    {
+      "SourceObjectId": "root-notice", "TargetObjectId": { "ObjectType": "StoredProcedure", "Schema": "public", "Name": "bad_notice" },
+      "SourceDefinition": "PRINT @message", "PostgreSqlDefinition": "CREATE PROCEDURE public.bad_notice() LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE v_message; END; $$;",
+      "RuleId": "PROCEDURE.PLPGSQL", "DeploymentPhase": "Procedures", "RequiresManualReview": false, "Dependencies": [],
+      "Validation": { "Outcome": "Failed", "SqlState": "42601", "Message": "too many parameters specified for RAISE NOTICE", "BlockingDependencies": [] }
+    },
+    {
+      "SourceObjectId": "root-end", "TargetObjectId": { "ObjectType": "Function", "Schema": "public", "Name": "bad_end" },
+      "SourceDefinition": "BEGIN IF 1=1 RETURN 1 END", "PostgreSqlDefinition": "CREATE FUNCTION public.bad_end() RETURNS int LANGUAGE plpgsql AS $$ BEGIN IF true THEN RETURN 1; END; $$;",
+      "RuleId": "FUNCTION.SCALAR.PLPGSQL", "DeploymentPhase": "Functions", "RequiresManualReview": false, "Dependencies": [],
+      "Validation": { "Outcome": "Failed", "SqlState": "42601", "Message": "syntax error at or near END", "BlockingDependencies": [] }
+    },
+    {
+      "SourceObjectId": "root-dynamic", "TargetObjectId": { "ObjectType": "StoredProcedure", "Schema": "public", "Name": "bad_dynamic" },
+      "SourceDefinition": "DECLARE @sql nvarchar(max); EXEC(@sql)", "PostgreSqlDefinition": "CREATE PROCEDURE public.bad_dynamic() LANGUAGE plpgsql AS $$ BEGIN EXEC(@sql); END; $$;",
+      "RuleId": "PROCEDURE.PLPGSQL", "DeploymentPhase": "Procedures", "RequiresManualReview": false, "Dependencies": [],
+      "Validation": { "Outcome": "Failed", "SqlState": "42601", "Message": "malformed dynamic SQL variable usage", "BlockingDependencies": [] }
+    },
+    {
+      "SourceObjectId": "root-round", "TargetObjectId": { "ObjectType": "Function", "Schema": "public", "Name": "bad_round" },
+      "SourceDefinition": "SELECT ROUND(@x, 2)", "PostgreSqlDefinition": "CREATE FUNCTION public.bad_round(x double precision) RETURNS double precision LANGUAGE sql AS $$ SELECT round(x, 2); $$;",
+      "RuleId": "FUNCTION.SCALAR.SQL", "DeploymentPhase": "Functions", "RequiresManualReview": false, "Dependencies": [],
+      "Validation": { "Outcome": "Failed", "SqlState": "42883", "Message": "function round(double precision, integer) does not exist", "BlockingDependencies": [] }
+    },
+    {
+      "SourceObjectId": "root-temporal", "TargetObjectId": { "ObjectType": "View", "Schema": "public", "Name": "bad_temporal" },
+      "SourceDefinition": "SELECT GETDATE(), DATEADD(day, 1, GETDATE()), DATEDIFF(day, GETDATE(), GETDATE())", "PostgreSqlDefinition": "CREATE VIEW public.bad_temporal AS SELECT GETDATE(), DATEADD(day, 1, GETDATE()), DATEDIFF(day, GETDATE(), GETDATE());",
+      "RuleId": "VIEW.STRUCTURED", "DeploymentPhase": "Views", "RequiresManualReview": false, "Dependencies": [],
+      "Validation": { "Outcome": "Failed", "SqlState": "42883", "Message": "function getdate() does not exist", "BlockingDependencies": [] }
+    },
+    {
+      "SourceObjectId": "blocked-one", "TargetObjectId": { "ObjectType": "View", "Schema": "public", "Name": "blocked_one" },
+      "SourceDefinition": "SELECT * FROM timestamp_default", "PostgreSqlDefinition": "CREATE VIEW public.blocked_one AS SELECT * FROM public.timestamp_default;",
+      "RuleId": "VIEW.STRUCTURED", "DeploymentPhase": "Views", "RequiresManualReview": false, "Dependencies": ["root-timestamp"],
+      "Validation": { "Outcome": "BlockedByDependency", "SqlState": "", "Message": "Blocked by failed dependency", "BlockingDependencies": ["root-timestamp"] }
+    },
+    {
+      "SourceObjectId": "blocked-two", "TargetObjectId": { "ObjectType": "View", "Schema": "public", "Name": "blocked_two" },
+      "SourceDefinition": "SELECT * FROM blocked_one", "PostgreSqlDefinition": "CREATE VIEW public.blocked_two AS SELECT * FROM public.blocked_one;",
+      "RuleId": "VIEW.STRUCTURED", "DeploymentPhase": "Views", "RequiresManualReview": false, "Dependencies": ["blocked-one"],
+      "Validation": { "Outcome": "BlockedByDependency", "SqlState": "", "Message": "Blocked by failed dependency", "BlockingDependencies": ["blocked-one"] }
+    },
+    {
+      "SourceObjectId": "passed", "TargetObjectId": { "ObjectType": "Table", "Schema": "public", "Name": "passed" },
+      "SourceDefinition": "CREATE TABLE dbo.passed(id int)", "PostgreSqlDefinition": "CREATE TABLE public.passed(id integer);",
+      "RuleId": "TABLE.STRUCTURED", "DeploymentPhase": "Tables", "RequiresManualReview": false, "Dependencies": [],
+      "Validation": { "Outcome": "Passed", "SqlState": "", "Message": "", "BlockingDependencies": [] }
+    }
+  ]
+}

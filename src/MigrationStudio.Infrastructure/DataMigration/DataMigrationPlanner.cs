@@ -37,7 +37,7 @@ public sealed partial class DataMigrationPlanner(
         var recoveredMappings = new List<IdentifierMappingEntry>();
         var caseSensitive = IsCaseSensitiveCollation(request.Inventory.Database.Collation);
         var targetMappings = request.Conversion.IdentifierMappings
-            .Where(item => !item.ObjectType.Equals("column", StringComparison.OrdinalIgnoreCase))
+            .Where(item => item.ObjectType.Equals("table", StringComparison.OrdinalIgnoreCase))
             .GroupBy(item => item.SourceObjectId)
             .ToDictionary(group => group.Key, group => group.Last());
         var columnTargets = request.Conversion.IdentifierMappings
@@ -95,7 +95,7 @@ public sealed partial class DataMigrationPlanner(
             {
                 target = canonicalMappings.LastOrDefault(item =>
                     item.SourceKey.ObjectId == table.ObjectId &&
-                    !item.ObjectType.Equals("column", StringComparison.OrdinalIgnoreCase));
+                    item.ObjectType.Equals("table", StringComparison.OrdinalIgnoreCase));
                 if (target is null)
                 {
                     warnings.Add($"{source.QualifiedSourceName} has no deterministic target identifier and was omitted.");

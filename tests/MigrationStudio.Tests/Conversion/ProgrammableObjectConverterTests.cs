@@ -3,6 +3,7 @@ using MigrationStudio.Domain.Conversion;
 using MigrationStudio.Domain.Inventory;
 using MigrationStudio.Infrastructure.Conversion;
 using MigrationStudio.Infrastructure.Conversion.Converters;
+using System.Text.RegularExpressions;
 
 namespace MigrationStudio.Tests.Conversion;
 
@@ -271,6 +272,162 @@ public sealed class ProgrammableObjectConverterTests
     }
 
     [Fact]
+    public async Task AssignmentIfElse_AfterSelectAssignment_UsesCompletePlpgsqlControlFlow()
+    {
+        var applicant = Object(InventoryObjectType.Table, "Applicant", null);
+        var function = Object(
+            InventoryObjectType.Function,
+            "CheckDuplicate",
+            """
+            CREATE FUNCTION [dbo].[CheckDuplicate](@jobCardNo varchar(35))
+            RETURNS bit AS
+            BEGIN
+                DECLARE @Return bit
+                DECLARE @RegNo int
+                SET @Return = 0
+                SET @RegNo = 0
+                SELECT @RegNo = COUNT(jobCardNo) FROM Applicant WHERE jobCardNo = @jobCardNo
+                IF @RegNo > 2
+                    SET @Return = 0
+                ELSE
+                    SET @Return = 1
+                RETURN @Return
+            END
+            """);
+        var module = Module(
+            function,
+            ModuleKind.ScalarFunction,
+            [Parameter(0, string.Empty, "bit"), Parameter(1, "@jobCardNo", "varchar", 35)]);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            function,
+            Context([applicant, function], [module]),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.AutomaticWithWarning, result.Classification);
+        Assert.Contains("SELECT COUNT(jobCardNo) INTO v_regno", result.Target, StringComparison.Ordinal);
+        Assert.Matches(@"IF\s+v_regno\s*>\s*2\s+THEN", result.Target!);
+        Assert.Contains("v_return := false;", result.Target, StringComparison.Ordinal);
+        Assert.Contains("v_return := true;", result.Target, StringComparison.Ordinal);
+        Assert.Contains("END IF;", result.Target, StringComparison.Ordinal);
+        Assert.Contains("RETURN v_return;", result.Target, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task NestedAssignmentIfBlocks_ArePreserved()
+    {
+        var function = Object(
+            InventoryObjectType.Function,
+            "NestedChecks",
+            """
+            CREATE FUNCTION [dbo].[NestedChecks](@mode char(1))
+            RETURNS bit AS
+            BEGIN
+                DECLARE @Return bit
+                SET @Return = 0
+                BEGIN
+                    IF (@mode = 'A' OR @mode = 'B')
+                    BEGIN
+                        SET @Return = 1
+                        IF (@Return = 1)
+                        BEGIN
+                            SET @Return = 0
+                        END
+                    END
+                END
+                RETURN @Return
+            END
+            """);
+        var module = Module(
+            function,
+            ModuleKind.ScalarFunction,
+            [Parameter(0, string.Empty, "bit"), Parameter(1, "@mode", "char", 1)]);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            function,
+            Context([function], [module]),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.AutomaticWithWarning, result.Classification);
+        Assert.Equal(2, Regex.Count(result.Target!, "END IF;", RegexOptions.CultureInvariant));
+        Assert.Contains("IF p_mode = 'A' OR p_mode = 'B' THEN", result.Target, StringComparison.Ordinal);
+        Assert.Matches(@"IF\s+v_return\s*=\s*true\s+THEN", result.Target!);
+    }
+
+    [Fact]
+    public async Task CompressedAssignmentIfBlocks_AndOuterEndTerminator_AreParsed()
+    {
+        var function = Object(
+            InventoryObjectType.Function,
+            "CompressedChecks",
+            """
+            CREATE FUNCTION [dbo].[CompressedChecks](@mode char(1)) RETURNS bit AS
+            BEGIN
+            DECLARE @Return bit DECLARE @unused nvarchar(max)
+            SET @Return=0 BEGIN IF (@mode='A') BEGIN SET @Return=1 END END RETURN @Return
+            END;
+            """);
+        var module = Module(
+            function,
+            ModuleKind.ScalarFunction,
+            [Parameter(0, string.Empty, "bit"), Parameter(1, "@mode", "char", 1)]);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            function,
+            Context([function], [module]),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.AutomaticWithWarning, result.Classification);
+        Assert.Contains("IF p_mode='A' THEN", result.Target, StringComparison.Ordinal);
+        Assert.Contains("v_return := true;", result.Target, StringComparison.Ordinal);
+        Assert.Contains("END IF;", result.Target, StringComparison.Ordinal);
+        Assert.Contains("RETURN v_return;", result.Target, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AssignmentIfElse_WithReturnInsideElse_PreservesFinalReturn()
+    {
+        var function = Object(
+            InventoryObjectType.Function,
+            "FiscalYear",
+            """
+            CREATE FUNCTION [dbo].[FiscalYear](@myDate AS datetime) RETURNS varchar(10) AS
+            BEGIN
+                DECLARE @month int
+                DECLARE @year int
+                DECLARE @finyear varchar(20)
+                SET @month = DATEPART(month, @myDate)
+                SET @year = DATEPART(year, @myDate)
+                IF @month >= 1 AND @month <= 3
+                BEGIN
+                    SET @finyear = CAST(@year - 1 AS varchar) + '-' + CAST(@year AS varchar)
+                END
+                ELSE
+                BEGIN
+                    SET @finyear = CAST(@year AS varchar) + '-' + CAST(@year + 1 AS varchar)
+                    RETURN @finyear
+                END
+                RETURN @finyear
+            END
+            """);
+        var module = Module(
+            function,
+            ModuleKind.ScalarFunction,
+            [Parameter(0, string.Empty, "varchar", 10), Parameter(1, "@myDate", "datetime")]);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            function,
+            Context([function], [module]),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.AutomaticWithWarning, result.Classification);
+        Assert.Contains("IF v_month >= 1 AND v_month <= 3 THEN", result.Target, StringComparison.Ordinal);
+        Assert.Contains("ELSE", result.Target, StringComparison.Ordinal);
+        Assert.Equal(2, Regex.Count(result.Target!, "RETURN v_finyear;", RegexOptions.CultureInvariant));
+        Assert.Contains("END IF;", result.Target, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task EmployeeAge_GuardAndCaseGenerateCompletePlpgsqlFunction()
     {
         var function = Object(
@@ -328,7 +485,7 @@ public sealed class ProgrammableObjectConverterTests
         var procedure = Object(
             InventoryObjectType.StoredProcedure,
             "WriteLog",
-            "CREATE PROCEDURE [dbo].[WriteLog] @name nvarchar(50) AS BEGIN INSERT INTO [dbo].[Log]([Name]) VALUES(@name); END");
+            "CREATE PROCEDURE [dbo].[WriteLog] @name nvarchar(50) AS BEGIN INSERT INTO [dbo].[Log]([Name]) VALUES(@name) END");
         var module = Module(procedure, ModuleKind.StoredProcedure, [Parameter(1, "@name", "nvarchar", 100)]);
         var context = Context([procedure], [module]);
 
@@ -339,6 +496,8 @@ public sealed class ProgrammableObjectConverterTests
         Assert.Contains("CREATE OR REPLACE PROCEDURE", result.Target, StringComparison.Ordinal);
         Assert.Contains("p_name", result.Target, StringComparison.Ordinal);
         Assert.Contains("\"dbo\".\"Log\"", result.Target, StringComparison.Ordinal);
+        Assert.Contains("VALUES(p_name);", result.Target, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains($";{Environment.NewLine}END;", result.Target, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -431,6 +590,420 @@ public sealed class ProgrammableObjectConverterTests
     }
 
     [Fact]
+    public async Task Procedure_DeclaresTypedLocalsAndTranslatesCompoundAssignmentsAndPrint()
+    {
+        var procedure = Object(
+            InventoryObjectType.StoredProcedure,
+            "Accumulate",
+            """
+            CREATE PROCEDURE [dbo].[Accumulate] AS
+            BEGIN
+                DECLARE @message varchar(100) = 'start', @count int = 1;
+                SET @message += ' done';
+                SET @count += 2;
+                PRINT(@message);
+            END
+            """);
+        var module = Module(procedure, ModuleKind.StoredProcedure, []);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            procedure,
+            Context([procedure], [module]),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.AutomaticWithWarning, result.Classification);
+        Assert.Contains("v_message varchar(100) := 'start';", result.Target, StringComparison.Ordinal);
+        Assert.Contains("v_count integer := 1;", result.Target, StringComparison.Ordinal);
+        Assert.Contains("v_message := v_message || ' done';", result.Target, StringComparison.Ordinal);
+        Assert.Contains("v_count := v_count + 2;", result.Target, StringComparison.Ordinal);
+        Assert.Contains("RAISE NOTICE '%', v_message;", result.Target, StringComparison.Ordinal);
+        Assert.DoesNotContain("@message", result.Target, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Procedure_RemovesNoCountOffAndTranslatesSimpleSetAssignment()
+    {
+        var procedure = Object(
+            InventoryObjectType.StoredProcedure,
+            "AssignLocal",
+            """
+            CREATE PROCEDURE [dbo].[AssignLocal] AS
+            BEGIN
+                SET NOCOUNT OFF
+                DECLARE @count int;
+                SET @count = 42
+            END
+            """);
+        var module = Module(procedure, ModuleKind.StoredProcedure, []);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            procedure,
+            Context([procedure], [module]),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.AutomaticWithWarning, result.Classification);
+        Assert.Contains("v_count := 42;", result.Target, StringComparison.Ordinal);
+        Assert.DoesNotContain("NOCOUNT", result.Target, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("SET v_", result.Target, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Procedure_WithUnparsedIfElseUsesValidManualReviewStub()
+    {
+        var procedure = Object(
+            InventoryObjectType.StoredProcedure,
+            "Conditional",
+            "CREATE PROCEDURE [dbo].[Conditional] AS BEGIN IF 1 = 1 PRINT 'yes'; ELSE PRINT 'no'; END");
+        var module = Module(procedure, ModuleKind.StoredProcedure, []);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            procedure,
+            Context([procedure], [module]),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.ManualConversion, result.Classification);
+        Assert.NotNull(result.Target);
+        Assert.Contains("RAISE EXCEPTION 'Manual conversion required", result.Target, StringComparison.Ordinal);
+        Assert.DoesNotContain("IF 1 = 1", result.Target!.Split("/* Source T-SQL:")[0], StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("procedure IF/ELSE control flow", result.UnsupportedConstructs, StringComparer.Ordinal);
+    }
+
+    [Fact]
+    public async Task Procedure_WithStaticSqlServerExecUsesValidManualReviewStub()
+    {
+        var procedure = Object(
+            InventoryObjectType.StoredProcedure,
+            "EncryptionWrapper",
+            "CREATE PROCEDURE [dbo].[EncryptionWrapper] AS BEGIN EXEC openkey; EXECUTE closekey; END");
+        var module = Module(procedure, ModuleKind.StoredProcedure, []);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            procedure,
+            Context([procedure], [module]),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.ManualConversion, result.Classification);
+        Assert.Contains("dynamic SQL", result.UnsupportedConstructs, StringComparer.Ordinal);
+        Assert.NotNull(result.Target);
+        Assert.DoesNotContain("EXEC openkey", result.Target!.Split("/* Source T-SQL:")[0], StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Procedure_ExecutesDeclaredDynamicSqlExpression()
+    {
+        var procedure = Object(
+            InventoryObjectType.StoredProcedure,
+            "DynamicSelect",
+            """
+            CREATE PROCEDURE [dbo].[DynamicSelect] AS
+            BEGIN
+                DECLARE @sql nvarchar(max) = N'SELECT 1';
+                EXECUTE (@sql);
+            END
+            """);
+        var module = Module(procedure, ModuleKind.StoredProcedure, [], containsDynamicSql: true);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            procedure,
+            Context([procedure], [module]),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.AutomaticWithWarning, result.Classification);
+        Assert.Contains("v_sql text := 'SELECT 1';", result.Target, StringComparison.Ordinal);
+        Assert.Contains("EXECUTE v_sql;", result.Target, StringComparison.Ordinal);
+        Assert.DoesNotContain("EXECUTE (", result.Target, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("@sql", result.Target, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Procedure_PreservesMultilineDynamicSqlAssignmentBeforePrintAndExecute()
+    {
+        var procedure = Object(
+            InventoryObjectType.StoredProcedure,
+            "DynamicReport",
+            """
+            CREATE PROCEDURE [dbo].[DynamicReport] @table_name varchar(50) AS
+            BEGIN
+                DECLARE @sql nvarchar(max);
+                SET @sql = 'SELECT *
+            FROM ' + @table_name
+                PRINT(@sql)
+                EXEC(@sql)
+            END
+            """);
+        var module = Module(
+            procedure,
+            ModuleKind.StoredProcedure,
+            [Parameter(1, "@table_name", "varchar", 50)],
+            containsDynamicSql: true);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            procedure,
+            Context([procedure], [module]),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.AutomaticWithWarning, result.Classification);
+        Assert.Contains("v_sql := 'SELECT *", result.Target, StringComparison.Ordinal);
+        Assert.Contains("FROM ' || p_table_name;", result.Target, StringComparison.Ordinal);
+        Assert.Contains("RAISE NOTICE '%', v_sql;", result.Target, StringComparison.Ordinal);
+        Assert.Contains("EXECUTE v_sql;", result.Target, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Procedure_RemovesStandaloneGroupingBlockBeforePrintAndDynamicExecute()
+    {
+        var procedure = Object(
+            InventoryObjectType.StoredProcedure,
+            "DynamicReportWithGroupingBlock",
+            """
+            CREATE PROCEDURE [dbo].[DynamicReportWithGroupingBlock] AS
+            DECLARE @sql nvarchar(max)
+            BEGIN
+                SET @sql = 'SELECT 1'
+            END
+            PRINT @sql
+            EXEC(@sql)
+            """);
+        var module = Module(procedure, ModuleKind.StoredProcedure, [], containsDynamicSql: true);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            procedure,
+            Context([procedure], [module]),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.AutomaticWithWarning, result.Classification);
+        Assert.Contains("v_sql := 'SELECT 1';", result.Target, StringComparison.Ordinal);
+        Assert.Contains("RAISE NOTICE '%', v_sql;", result.Target, StringComparison.Ordinal);
+        Assert.Contains("EXECUTE v_sql;", result.Target, StringComparison.Ordinal);
+        Assert.DoesNotContain("END\nRAISE", result.Target!.Replace("\r\n", "\n"), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("END\nSELECT", result.Target.Replace("\r\n", "\n"), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ScalarSubqueryAssignmentBeforeIf_PlacesIntoBeforeTerminator()
+    {
+        var sourceTable = Object(InventoryObjectType.Table, "DaySource", null);
+        var function = Object(
+            InventoryObjectType.Function,
+            "HasDays",
+            """
+            CREATE FUNCTION [dbo].[HasDays](@id int) RETURNS bit AS
+            BEGIN
+                DECLARE @days int
+                DECLARE @result bit
+                SELECT @days = (SELECT total_days FROM DaySource WHERE id = @id);
+                IF @days > 0
+                    SET @result = 1
+                ELSE
+                    SET @result = 0
+                RETURN @result
+            END
+            """);
+        var module = Module(
+            function,
+            ModuleKind.ScalarFunction,
+            [Parameter(0, string.Empty, "bit"), Parameter(1, "@id", "int")]);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            function,
+            Context([sourceTable, function], [module]),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.AutomaticWithWarning, result.Classification);
+        Assert.Contains(") INTO v_days;", result.Target, StringComparison.Ordinal);
+        Assert.DoesNotContain("); INTO", result.Target, StringComparison.Ordinal);
+        Assert.Contains("END IF;", result.Target, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MetadataMultiTargetSelectAssignment_UsesManualReviewStub()
+    {
+        var function = Object(
+            InventoryObjectType.Function,
+            "MetadataFlags",
+            """
+            CREATE FUNCTION [dbo].[MetadataFlags]() RETURNS int AS
+            BEGIN
+                DECLARE @first int
+                DECLARE @second int
+                SELECT @first = OBJECT_ID('dbo.First'), @second = OBJECT_ID('dbo.Second')
+                IF @first IS NOT NULL SET @second = @second + 1
+                RETURN @second
+            END
+            """);
+        var module = Module(function, ModuleKind.ScalarFunction, [Parameter(0, string.Empty, "int")]);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            function,
+            Context([function], [module]),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.ManualConversion, result.Classification);
+        Assert.Contains("metadata multi-target SELECT assignment", result.UnsupportedConstructs, StringComparer.Ordinal);
+        Assert.Contains("RAISE EXCEPTION 'Manual conversion required", result.Target, StringComparison.Ordinal);
+        Assert.Contains("RETURNS integer", result.Target, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Procedure_AddsOptionalIntoToSqlServerInsertSyntax()
+    {
+        var targetTable = Object(InventoryObjectType.Table, "History", null);
+        var procedure = Object(
+            InventoryObjectType.StoredProcedure,
+            "WriteHistory",
+            "CREATE PROCEDURE [dbo].[WriteHistory] @id int AS BEGIN INSERT History(Id) VALUES(@id) END");
+        var module = Module(procedure, ModuleKind.StoredProcedure, [Parameter(1, "@id", "int")]);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            procedure,
+            Context([targetTable, procedure], [module]),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.AutomaticWithWarning, result.Classification);
+        Assert.Contains("INSERT INTO", result.Target, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("VALUES(p_id);", result.Target, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Procedure_TerminatesAdjacentDmlStatements()
+    {
+        var first = Object(InventoryObjectType.Table, "FirstTable", null);
+        var second = Object(InventoryObjectType.Table, "SecondTable", null);
+        var procedure = Object(
+            InventoryObjectType.StoredProcedure,
+            "WriteAndUpdate",
+            """
+            CREATE PROCEDURE [dbo].[WriteAndUpdate] @id int AS
+            BEGIN
+                INSERT INTO FirstTable(Id) VALUES(@id)
+                UPDATE SecondTable SET Id = @id
+                UPDATE FirstTable SET Id = @id
+            END
+            """);
+        var module = Module(procedure, ModuleKind.StoredProcedure, [Parameter(1, "@id", "int")]);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            procedure,
+            Context([first, second, procedure], [module]),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.AutomaticWithWarning, result.Classification);
+        Assert.Matches(@"VALUES\(p_id\);\s+UPDATE", result.Target!);
+        Assert.Matches(@"SET Id = p_id;\s+UPDATE", result.Target!);
+    }
+
+    [Fact]
+    public async Task Procedure_RemovesWithNoLockWithoutLeavingDanglingWith()
+    {
+        var sourceTable = Object(InventoryObjectType.Table, "Queue", null);
+        var procedure = Object(
+            InventoryObjectType.StoredProcedure,
+            "UpdateQueue",
+            """
+            CREATE PROCEDURE [dbo].[UpdateQueue] AS
+            BEGIN
+                UPDATE Queue SET Status = 1
+                WHERE Id IN (SELECT Id FROM Queue WITH (NOLOCK) WHERE Status = 0)
+            END
+            """);
+        var module = Module(procedure, ModuleKind.StoredProcedure, []);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            procedure,
+            Context([sourceTable, procedure], [module]),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.AutomaticWithWarning, result.Classification);
+        Assert.DoesNotContain("NOLOCK", result.Target, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Queue WITH", result.Target, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("UPDATE", result.Target, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Procedure_UpdatableSqlServerCteUsesManualReviewStub()
+    {
+        var sourceTable = Object(InventoryObjectType.Table, "Queue", null);
+        var procedure = Object(
+            InventoryObjectType.StoredProcedure,
+            "UpdateQueueCte",
+            """
+            CREATE PROCEDURE [dbo].[UpdateQueueCte] AS
+            BEGIN
+                WITH pending AS
+                (SELECT Id, Status FROM Queue WITH (NOLOCK) WHERE Status = 0)
+                UPDATE pending SET Status = 1
+            END
+            """);
+        var module = Module(procedure, ModuleKind.StoredProcedure, []);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            procedure,
+            Context([sourceTable, procedure], [module]),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.ManualConversion, result.Classification);
+        Assert.Contains("updatable CTE", result.UnsupportedConstructs, StringComparer.Ordinal);
+        Assert.Contains("CREATE OR REPLACE PROCEDURE", result.Target, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Procedure_RemovesAnsiWarningsSessionDirective()
+    {
+        var procedure = Object(
+            InventoryObjectType.StoredProcedure,
+            "SessionDirective",
+            """
+            CREATE PROCEDURE [dbo].[SessionDirective] AS
+            BEGIN
+                SET ANSI_WARNINGS OFF;
+                DECLARE @sql nvarchar(max);
+                SET @sql = 'SELECT 1';
+                EXEC(@sql);
+            END
+            """);
+        var module = Module(procedure, ModuleKind.StoredProcedure, [], containsDynamicSql: true);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            procedure,
+            Context([procedure], [module]),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.AutomaticWithWarning, result.Classification);
+        Assert.DoesNotContain("ANSI_WARNINGS", result.Target, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("EXECUTE v_sql;", result.Target, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Procedure_ExecutesConcatenatedDeclaredDynamicSql()
+    {
+        var procedure = Object(
+            InventoryObjectType.StoredProcedure,
+            "DynamicBatch",
+            """
+            CREATE PROCEDURE [dbo].[DynamicBatch] AS
+            BEGIN
+                DECLARE @sql1 nvarchar(max)
+                DECLARE @sql2 nvarchar(max)
+                SET @sql1 = 'SELECT 1'
+                SET @sql2 = '; SELECT 2'
+                PRINT @sql1 + @sql2
+                EXECUTE(@sql1 + @sql2)
+            END
+            """);
+        var module = Module(procedure, ModuleKind.StoredProcedure, [], containsDynamicSql: true);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            procedure,
+            Context([procedure], [module]),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.AutomaticWithWarning, result.Classification);
+        Assert.Contains("RAISE NOTICE '%', v_sql1 || v_sql2;", result.Target, StringComparison.Ordinal);
+        Assert.Contains("EXECUTE v_sql1 || v_sql2;", result.Target, StringComparison.Ordinal);
+        Assert.DoesNotContain("EXECUTE(", result.Target, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task ResultSetSelectHasSpecificManualReason()
     {
         var procedure = Object(
@@ -446,9 +1019,162 @@ public sealed class ProgrammableObjectConverterTests
 
         Assert.Equal(ConversionClassification.ManualConversion, result.Classification);
         Assert.Contains(
-            "result-set SELECT interface",
+            "dynamic or multiple result-set interface",
             result.UnsupportedConstructs,
             StringComparer.Ordinal);
+    }
+
+    [Fact]
+    public async Task ScalarCaseReturn_PreservesCaseEndBeforeRoutineEnd()
+    {
+        var function = Object(
+            InventoryObjectType.Function,
+            "FiscalYearNew",
+            """
+            CREATE FUNCTION dbo.FiscalYearNew(@value datetime) RETURNS varchar(10) AS
+            BEGIN
+                RETURN CASE WHEN MONTH(@value) >= 4
+                    THEN CAST(YEAR(@value) AS varchar) + '-' + CAST(YEAR(@value) + 1 AS varchar)
+                    ELSE CAST(YEAR(@value) - 1 AS varchar) + '-' + CAST(YEAR(@value) AS varchar) END
+            END
+            """);
+        var module = Module(
+            function,
+            ModuleKind.ScalarFunction,
+            [Parameter(0, string.Empty, "varchar", 10), Parameter(1, "@value", "datetime")]);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            function,
+            Context([function], [module]),
+            CancellationToken.None);
+
+        Assert.NotEqual(ConversionClassification.ManualConversion, result.Classification);
+        Assert.Contains("ELSE", result.Target, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(" END;", result.Target, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("'-'", result.Target, StringComparison.Ordinal);
+        Assert.Contains("||", result.Target, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Procedure_FinalDmlBeforeTrailingCommentGetsEffectiveTerminator()
+    {
+        var table = Object(InventoryObjectType.Table, "GroupMaster", null);
+        var procedure = Object(
+            InventoryObjectType.StoredProcedure,
+            "InsertGroup",
+            """
+            CREATE PROCEDURE dbo.InsertGroup @id int AS
+            BEGIN
+                INSERT INTO GroupMaster(Id) VALUES(@id)
+                -- execute InsertGroup
+            END
+            """);
+        var module = Module(procedure, ModuleKind.StoredProcedure, [Parameter(1, "@id", "int")]);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            procedure,
+            Context([table, procedure], [module]),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.AutomaticWithWarning, result.Classification);
+        Assert.Matches(@"VALUES\(p_id\);\s*-- execute", result.Target!);
+    }
+
+    [Fact]
+    public async Task Procedure_DeclarationInitializerStopsBeforeFollowingSet()
+    {
+        var procedure = Object(
+            InventoryObjectType.StoredProcedure,
+            "BuildSql",
+            """
+            CREATE PROCEDURE dbo.BuildSql @fin_year char(9) AS
+            BEGIN
+                DECLARE @fy char(4)
+                DECLARE @sql varchar(8000) = ''
+                SET @fy = SUBSTRING(@fin_year, 3, 2) + SUBSTRING(@fin_year, 8, 2)
+                SET @sql = 'SELECT ' + @fy
+                EXEC(@sql)
+            END
+            """);
+        var module = Module(
+            procedure,
+            ModuleKind.StoredProcedure,
+            [Parameter(1, "@fin_year", "char", 9)],
+            containsDynamicSql: true);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            procedure,
+            Context([procedure], [module]),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.AutomaticWithWarning, result.Classification);
+        Assert.Contains("v_sql varchar(8000) := '';", result.Target, StringComparison.Ordinal);
+        Assert.Contains("v_fy := substring(p_fin_year, 3, 2)", result.Target, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("v_sql varchar(8000) := v_fy", result.Target, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ViewMapsGloballyUniqueUnqualifiedRelationsAcrossUnionBranches()
+    {
+        var first = Object(InventoryObjectType.Table, "FirstRoll", null) with
+        {
+            SourceSchema = "legacy",
+            QualifiedSourceName = "[legacy].[FirstRoll]"
+        };
+        var second = Object(InventoryObjectType.Table, "SecondRoll", null) with
+        {
+            SourceSchema = "legacy",
+            QualifiedSourceName = "[legacy].[SecondRoll]"
+        };
+        var view = Object(
+            InventoryObjectType.View,
+            "AllRolls",
+            "CREATE VIEW dbo.AllRolls AS SELECT * FROM FirstRoll UNION ALL SELECT * FROM SecondRoll");
+        var module = Module(view, ModuleKind.View, []);
+        var context = Context([first, second, view], [module]);
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            view,
+            context,
+            CancellationToken.None);
+
+        Assert.Contains(context.Identifiers.MapObject(first).QualifiedName, result.Target, StringComparison.Ordinal);
+        Assert.Contains(context.Identifiers.MapObject(second).QualifiedName, result.Target, StringComparison.Ordinal);
+        Assert.DoesNotContain("FROM FirstRoll", result.Target, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("FROM SecondRoll", result.Target, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ViewWithUnresolvedCatalogRelationUsesValidManualStub()
+    {
+        var view = Object(
+            InventoryObjectType.View,
+            "UnresolvedView",
+            "CREATE VIEW dbo.UnresolvedView AS SELECT * FROM MissingRoll");
+        var module = Module(view, ModuleKind.View, []);
+        var inventory = TestInventory.CreateSnapshot([view]) with
+        {
+            Modules = [module],
+            Dependencies =
+            [
+                new InventoryDependency(
+                    view.Id,
+                    null,
+                    DependencyKind.SqlExpression,
+                    "MissingRoll",
+                    false,
+                    false)
+            ]
+        };
+
+        var result = await new ProgrammableObjectConverter().ConvertAsync(
+            view,
+            Context(inventory),
+            CancellationToken.None);
+
+        Assert.Equal(ConversionClassification.ManualConversion, result.Classification);
+        Assert.Contains("unresolved relation MissingRoll", result.UnsupportedConstructs, StringComparer.Ordinal);
+        Assert.Contains("SELECT NULL::text AS manual_review WHERE false", result.Target, StringComparison.Ordinal);
     }
 
     [Fact]

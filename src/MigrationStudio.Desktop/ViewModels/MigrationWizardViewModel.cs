@@ -263,7 +263,11 @@ public sealed partial class MigrationWizardViewModel : ObservableObject, IDispos
                     $"converted={validatedRun.Artifacts.Count:N0}, packaged={Workspace.PackagedArtifactCount:N0}.");
             }
             ActivePackage = package;
-            SetState(MigrationWizardStep.Convert, WizardStepState.Completed,
+            var reconciliation = validatedRun.PublicationReconciliation;
+            var hasWarnings = validatedRun.RequiresManualReview ||
+                              reconciliation?.HasWarnings == true;
+            SetState(MigrationWizardStep.Convert,
+                SuccessfulConversionState(hasWarnings),
                 $"Conversion and live PostgreSQL validation complete · {run.Artifacts.Count:N0} objects · validated package verified.");
         });
     }
@@ -647,23 +651,64 @@ public sealed partial class MigrationWizardViewModel : ObservableObject, IDispos
 
     private void OnWorkspacePropertyChanged(object? sender, PropertyChangedEventArgs args)
     {
-        if (args.PropertyName is nameof(WorkspaceViewModel.Server) or
-            nameof(WorkspaceViewModel.Port) or nameof(WorkspaceViewModel.UseWindowsAuthentication) or
-            nameof(WorkspaceViewModel.Username) or nameof(WorkspaceViewModel.Password) or
+        var propertyName = args.PropertyName;
+
+        if (propertyName is nameof(WorkspaceViewModel.Server) or
+            nameof(WorkspaceViewModel.Port) or
+            nameof(WorkspaceViewModel.UseWindowsAuthentication) or
+            nameof(WorkspaceViewModel.Username) or
+            nameof(WorkspaceViewModel.Password) or
             nameof(WorkspaceViewModel.SelectedDatabase))
         {
             RefreshConnectionStep();
-            InvalidateAfter(MigrationWizardStep.Connect,
+            InvalidateAfter(
+                MigrationWizardStep.Connect,
                 "Source connection changed. Selection and later steps must be rerun.");
-        }
-        else if (args.PropertyName is nameof(WorkspaceViewModel.ScopeMode) or
-                 nameof(WorkspaceViewModel.ExcelPath))
-        {
-            InvalidateAfter(MigrationWizardStep.Select,
-                "Source selection changed. Analysis and later steps must be rerun.");
+            NotifyConnectionSummaries();
+            return;
         }
 
-        NotifySummaries();
+        if (propertyName is nameof(WorkspaceViewModel.ScopeMode) or
+            nameof(WorkspaceViewModel.ExcelPath))
+        {
+            InvalidateAfter(
+                MigrationWizardStep.Select,
+                "Source selection changed. Analysis and later steps must be rerun.");
+            NotifySelectionSummaries();
+            return;
+        }
+
+        /*
+         * Deployment emits frequent progress notifications. They must not trigger
+         * expensive inventory and identifier-mapping summary recalculation.
+         */
+        if (propertyName is nameof(WorkspaceViewModel.DeploymentId) or
+            nameof(WorkspaceViewModel.DeploymentCurrentObject) or
+            nameof(WorkspaceViewModel.DeploymentStatus) or
+            nameof(WorkspaceViewModel.DeploymentCompleted) or
+            nameof(WorkspaceViewModel.DeploymentFailed) or
+            nameof(WorkspaceViewModel.DeploymentSkipped) or
+            nameof(WorkspaceViewModel.DeploymentProgress) or
+            nameof(WorkspaceViewModel.IsDeploymentRunning) or
+            nameof(WorkspaceViewModel.HasSuccessfulSchemaDeployment) or
+            nameof(WorkspaceViewModel.IsBusy))
+        {
+            NotifyNavigation();
+            return;
+        }
+
+        if (propertyName is nameof(WorkspaceViewModel.ObjectCount) or
+            nameof(WorkspaceViewModel.IncludedCount) or
+            nameof(WorkspaceViewModel.FindingCount) or
+            nameof(WorkspaceViewModel.SelectedArtifactCount) or
+            nameof(WorkspaceViewModel.ConvertedArtifactCount) or
+            nameof(WorkspaceViewModel.PackagedArtifactCount) or
+            nameof(WorkspaceViewModel.PackagedExecutableCount) or
+            nameof(WorkspaceViewModel.PackagedManualReviewCount) or
+            nameof(WorkspaceViewModel.PackagedUnsupportedCount))
+        {
+            NotifyInventoryAndConversionSummaries();
+        }
     }
 
     private void OnTargetPropertyChanged(object? sender, PropertyChangedEventArgs args)
@@ -679,7 +724,13 @@ public sealed partial class MigrationWizardViewModel : ObservableObject, IDispos
     }
 
     private bool IsStepComplete(MigrationWizardStep step) =>
-        Steps[(int)step].State is WizardStepState.Completed or WizardStepState.CompletedWithWarnings;
+        IsCompletedState(Steps[(int)step].State);
+
+    internal static WizardStepState SuccessfulConversionState(bool hasWarnings) =>
+        hasWarnings ? WizardStepState.CompletedWithWarnings : WizardStepState.Completed;
+
+    internal static bool IsCompletedState(WizardStepState state) =>
+        state is WizardStepState.Completed or WizardStepState.CompletedWithWarnings;
 
     private void SetState(MigrationWizardStep step, WizardStepState state, string message)
     {
@@ -734,11 +785,33 @@ public sealed partial class MigrationWizardViewModel : ObservableObject, IDispos
 
     private void NotifySummaries()
     {
+        NotifyConnectionSummaries();
+        NotifySelectionSummaries();
+        NotifyInventoryAndConversionSummaries();
+
+        /*
+         * These two properties scan the large identifier mapping set. Notify them
+         * only at explicit workflow boundaries, never for deployment progress.
+         */
+        OnPropertyChanged(nameof(AutomaticallyRenamedCount));
+        OnPropertyChanged(nameof(UnresolvedMappingCount));
+    }
+
+    private void NotifyConnectionSummaries()
+    {
         OnPropertyChanged(nameof(SourceConnected));
         OnPropertyChanged(nameof(TargetConnected));
+    }
+
+    private void NotifySelectionSummaries()
+    {
         OnPropertyChanged(nameof(SelectedSchemaCount));
         OnPropertyChanged(nameof(SelectedTableCount));
         OnPropertyChanged(nameof(EstimatedRows));
+    }
+
+    private void NotifyInventoryAndConversionSummaries()
+    {
         OnPropertyChanged(nameof(TableCount));
         OnPropertyChanged(nameof(ViewCount));
         OnPropertyChanged(nameof(ProcedureCount));
@@ -752,8 +825,6 @@ public sealed partial class MigrationWizardViewModel : ObservableObject, IDispos
         OnPropertyChanged(nameof(ExecutableObjectCount));
         OnPropertyChanged(nameof(ManualReviewObjectCount));
         OnPropertyChanged(nameof(UnsupportedObjectCount));
-        OnPropertyChanged(nameof(AutomaticallyRenamedCount));
-        OnPropertyChanged(nameof(UnresolvedMappingCount));
     }
 
     public void Dispose()

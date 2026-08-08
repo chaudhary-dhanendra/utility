@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using ClosedXML.Excel;
@@ -32,6 +33,7 @@ public sealed class ConversionReportWriter : IConversionReportWriter
         await WriteCsvAsync(run, reportsDirectory, cancellationToken).ConfigureAwait(false);
         await WriteHtmlAsync(run, reportsDirectory, cancellationToken).ConfigureAwait(false);
         await WriteJsonAsync(run, reportsDirectory, cancellationToken).ConfigureAwait(false);
+        await WritePackageReportsAsync(run, reportsDirectory, cancellationToken).ConfigureAwait(false);
     }
 
     private static void WriteExcelReports(
@@ -604,6 +606,196 @@ public sealed class ConversionReportWriter : IConversionReportWriter
             run.IdentifierMappings,
             JsonOptions,
             cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task WritePackageReportsAsync(
+        ConversionRun run,
+        string directory,
+        CancellationToken cancellationToken)
+    {
+        var reviews = run.Artifacts.Where(item => item.RequiresManualReview).Select(artifact =>
+        {
+            var mapping = run.IdentifierMappings.FirstOrDefault(item =>
+                item.SourceObjectId == artifact.SourceObjectId &&
+                string.Equals(item.ObjectType, artifact.TargetObjectId.ObjectType, StringComparison.OrdinalIgnoreCase)) ??
+                run.IdentifierMappings.FirstOrDefault(item => item.SourceObjectId == artifact.SourceObjectId);
+            var findings = artifact.Findings.Where(item => item.Severity >= FindingSeverity.Warning).ToArray();
+            return new ManualReviewReportItem
+            {
+                FindingId = $"MR-{artifact.SourceObjectId}-{artifact.RuleId}",
+                SourceObjectId = artifact.SourceObjectId.ToString(),
+                SourceSchema = mapping?.SourceSchema ?? string.Empty,
+                SourceObjectName = mapping?.SourceName ?? string.Empty,
+                QualifiedSourceName = mapping?.SourceQualifiedName ?? string.Empty,
+                ObjectType = artifact.TargetObjectId.ObjectType,
+                TargetSchema = artifact.TargetObjectId.Schema,
+                TargetObjectName = artifact.TargetObjectId.Name,
+                GeneratedArtifactPath = $"ManualReview/{artifact.TargetObjectId.Name}_{artifact.SourceObjectId}.sql",
+                SourceDefinitionHash = Hash(artifact.SourceDefinition),
+                TargetSqlHash = Hash(artifact.PostgreSqlDefinition),
+                Status = artifact.Classification == ConversionClassification.Unsupported
+                    ? "UnsupportedWithStub"
+                    : "ManualReviewRequired",
+                ConversionStrategyAttempted = artifact.RuleId,
+                ConfidenceLevel = ConfidenceName(artifact.Confidence),
+                UnsupportedConstruct = string.Join("; ", artifact.UnsupportedConstructs),
+                ExactSourceFragment = "Redacted; consult the preserved per-object review artifact.",
+                ReasonAutomaticConversionIsUnsafe = findings.FirstOrDefault()?.Message ??
+                    "The converter could not prove PostgreSQL semantic equivalence.",
+                SemanticRisk = string.Join("; ", findings.Select(item => item.Message)),
+                RecommendedPostgreSqlStrategy = string.Join("; ", findings.Select(item => item.Remediation).Where(item => !string.IsNullOrWhiteSpace(item))),
+                CompatibilityStubStatus = ContainsExecutableStub(artifact.PostgreSqlDefinition)
+                    ? "Generated; deployable but not semantically equivalent"
+                    : "Not generated",
+                Dependencies = artifact.Dependencies.Select(item => item.ToString()).ToArray(),
+                BlockedDependents = run.Artifacts.Where(item => item.Dependencies.Contains(artifact.SourceObjectId))
+                    .Select(item => item.SourceObjectId.ToString()).ToArray(),
+                DeploymentImpact = artifact.Validation.Outcome.ToString(),
+                UnrelatedDeploymentMayContinue = true,
+                RequiredReviewerAction = "Select and implement a PostgreSQL strategy, deploy it, and approve representative behavior tests.",
+                SuggestedTestCases = ["Nominal behavior", "NULL and boundary inputs", "Error and transaction behavior", "Dependent-object calls"],
+                ReviewStatus = "Open",
+                CreatedTimestamp = run.GeneratedAt
+            };
+        }).ToArray();
+
+        await WriteJsonFileAsync(Path.Combine(directory, "manual-review-report.json"), reviews, cancellationToken)
+            .ConfigureAwait(false);
+        await WriteJsonFileAsync(
+            Path.Combine(directory, "manual-review-summary.json"),
+            new
+            {
+                total = reviews.Length,
+                byObjectType = reviews.GroupBy(item => item.ObjectType).ToDictionary(group => group.Key, group => group.Count()),
+                byConstruct = reviews.GroupBy(item => item.UnsupportedConstruct).ToDictionary(group => group.Key, group => group.Count()),
+                compatibilityStubs = reviews.Count(item => item.CompatibilityStubStatus.StartsWith("Generated", StringComparison.Ordinal))
+            },
+            cancellationToken).ConfigureAwait(false);
+
+        await using (var stream = new FileStream(
+                         Path.Combine(directory, "manual-review-report.csv"),
+                         FileMode.Create, FileAccess.Write, FileShare.Read, 65536,
+                         FileOptions.Asynchronous | FileOptions.SequentialScan))
+        await using (var writer = new StreamWriter(stream, new UTF8Encoding(true), 65536))
+        {
+            await writer.WriteLineAsync("Finding ID,Source Object ID,Source Schema,Source Object,Qualified Source,Object Type,Target Schema,Target Object,Status,Strategy,Confidence,Unsupported Construct,Reason,Semantic Risk,Stub Status,Deployment Impact,Unrelated Deployment May Continue,Required Reviewer Action,Review Status,Created Timestamp").ConfigureAwait(false);
+            foreach (var item in reviews)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                await writer.WriteLineAsync(string.Join(',', new[]
+                {
+                    item.FindingId, item.SourceObjectId, item.SourceSchema, item.SourceObjectName,
+                    item.QualifiedSourceName, item.ObjectType, item.TargetSchema, item.TargetObjectName,
+                    item.Status, item.ConversionStrategyAttempted, item.ConfidenceLevel,
+                    item.UnsupportedConstruct, item.ReasonAutomaticConversionIsUnsafe, item.SemanticRisk,
+                    item.CompatibilityStubStatus, item.DeploymentImpact,
+                    item.UnrelatedDeploymentMayContinue.ToString(CultureInfo.InvariantCulture),
+                    item.RequiredReviewerAction, item.ReviewStatus, item.CreatedTimestamp.ToString("O", CultureInfo.InvariantCulture)
+                }.Select(Csv))).ConfigureAwait(false);
+            }
+            await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        var summary = new
+        {
+            totalSourceObjects = run.Artifacts.Select(item => item.SourceObjectId).Distinct().Count(),
+            automaticallyConvertedObjects = run.Artifacts.Count(item => !item.RequiresManualReview && item.Classification == ConversionClassification.Automatic),
+            convertedWithStrategyObjects = run.Artifacts.Count(item => !item.RequiresManualReview && item.Classification == ConversionClassification.AutomaticWithWarning),
+            manualReviewObjects = reviews.Length,
+            compatibilityStubs = reviews.Count(item => item.CompatibilityStubStatus.StartsWith("Generated", StringComparison.Ordinal)),
+            externalDependencies = run.Findings.Count(item => item.Code.Contains("DEPENDENCY", StringComparison.OrdinalIgnoreCase)),
+            failedLiveValidationArtifacts = run.Artifacts.Count(item => item.Validation.Outcome == LiveSqlValidationOutcome.Failed),
+            dependencyBlockedArtifacts = run.Artifacts.Count(item => item.Validation.Outcome == LiveSqlValidationOutcome.BlockedByDependency),
+            supportedTransformationsUsed = run.Artifacts.Select(item => item.RuleId).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray()
+        };
+        await WriteJsonFileAsync(Path.Combine(directory, "conversion-summary.json"), summary, cancellationToken)
+            .ConfigureAwait(false);
+
+        var reviewRows = string.Join(Environment.NewLine, reviews.Select(item =>
+            $"<tr><td>{H(item.QualifiedSourceName)}</td><td>{H(item.TargetSchema + "." + item.TargetObjectName)}</td><td>{H(item.UnsupportedConstruct)}</td><td>{H(item.RequiredReviewerAction)}</td><td>{H(item.CompatibilityStubStatus)}</td></tr>"));
+        var manualHtml = $"<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Manual review report</title><style>body{{font-family:Segoe UI,Arial,sans-serif;margin:2rem}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ccd0d5;padding:.45rem;text-align:left}}th{{background:#eef2f7}}</style></head><body><h1>Manual review report</h1><p>Items: <strong>{reviews.Length}</strong>; deployable compatibility stubs: <strong>{summary.compatibilityStubs}</strong>.</p><p><label>Filter <input id=\"filter\" type=\"search\"></label></p><table><thead><tr><th>Source</th><th>Target</th><th>Construct</th><th>Recommended action</th><th>Stub</th></tr></thead><tbody>{reviewRows}</tbody></table><script>document.getElementById('filter').addEventListener('input',function(){{var q=this.value.toLowerCase();document.querySelectorAll('tbody tr').forEach(function(r){{r.hidden=!r.textContent.toLowerCase().includes(q);}});}});</script></body></html>";
+        await File.WriteAllTextAsync(Path.Combine(directory, "manual-review-report.html"), manualHtml, new UTF8Encoding(false), cancellationToken).ConfigureAwait(false);
+        await File.WriteAllTextAsync(Path.Combine(directory, "conversion-summary.html"), manualHtml.Replace("Manual review report", "Conversion summary", StringComparison.Ordinal), new UTF8Encoding(false), cancellationToken).ConfigureAwait(false);
+
+        await using var validationStream = new FileStream(
+            Path.Combine(directory, "artifact-validation.csv"), FileMode.Create, FileAccess.Write,
+            FileShare.Read, 65536, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        await using var validationWriter = new StreamWriter(validationStream, new UTF8Encoding(true), 65536);
+        await validationWriter.WriteLineAsync("Source Object ID,Target Artifact,Classification,Manual Review,Structurally Valid,Live Outcome,SQLSTATE,Message,Blocking Dependencies").ConfigureAwait(false);
+        foreach (var artifact in run.Artifacts)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await validationWriter.WriteLineAsync(string.Join(',', new[]
+            {
+                artifact.SourceObjectId.ToString(), artifact.TargetObjectId.QualifiedName,
+                artifact.Classification.ToString(), artifact.RequiresManualReview.ToString(CultureInfo.InvariantCulture),
+                artifact.Validation.IsStructurallyValid.ToString(CultureInfo.InvariantCulture), artifact.Validation.Outcome.ToString(),
+                artifact.Validation.SqlState ?? string.Empty, artifact.Validation.Message ?? string.Empty,
+                string.Join(';', artifact.Validation.BlockingDependencies)
+            }.Select(Csv))).ConfigureAwait(false);
+        }
+        await validationWriter.FlushAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task WriteJsonFileAsync<T>(string path, T value, CancellationToken cancellationToken)
+    {
+        await using var stream = new FileStream(
+            path, FileMode.Create, FileAccess.Write, FileShare.Read, 65536,
+            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        await JsonSerializer.SerializeAsync(stream, value, JsonOptions, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static string Hash(string value) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
+
+    private static string ConfidenceName(decimal confidence) => confidence switch
+    {
+        >= 0.8m => "High",
+        >= 0.5m => "Medium",
+        > 0m => "Low",
+        _ => "Unknown"
+    };
+
+    private static bool ContainsExecutableStub(string sql) =>
+        sql.Contains("CREATE OR REPLACE", StringComparison.OrdinalIgnoreCase) &&
+        (sql.Contains("RAISE EXCEPTION", StringComparison.OrdinalIgnoreCase) ||
+         sql.Contains("manual_review", StringComparison.OrdinalIgnoreCase));
+
+    private sealed record ManualReviewReportItem
+    {
+        public required string FindingId { get; init; }
+        public required string SourceObjectId { get; init; }
+        public required string SourceSchema { get; init; }
+        public required string SourceObjectName { get; init; }
+        public required string QualifiedSourceName { get; init; }
+        public required string ObjectType { get; init; }
+        public required string TargetSchema { get; init; }
+        public required string TargetObjectName { get; init; }
+        public required string GeneratedArtifactPath { get; init; }
+        public required string SourceDefinitionHash { get; init; }
+        public required string TargetSqlHash { get; init; }
+        public required string Status { get; init; }
+        public required string ConversionStrategyAttempted { get; init; }
+        public required string ConfidenceLevel { get; init; }
+        public required string UnsupportedConstruct { get; init; }
+        public required string ExactSourceFragment { get; init; }
+        public int? SourceLine { get; init; }
+        public int? SourceColumn { get; init; }
+        public string SourceSpan { get; init; } = string.Empty;
+        public required string ReasonAutomaticConversionIsUnsafe { get; init; }
+        public required string SemanticRisk { get; init; }
+        public required string RecommendedPostgreSqlStrategy { get; init; }
+        public required string CompatibilityStubStatus { get; init; }
+        public required string[] Dependencies { get; init; }
+        public required string[] BlockedDependents { get; init; }
+        public required string DeploymentImpact { get; init; }
+        public bool UnrelatedDeploymentMayContinue { get; init; }
+        public required string RequiredReviewerAction { get; init; }
+        public required string[] SuggestedTestCases { get; init; }
+        public string Reviewer { get; init; } = string.Empty;
+        public required string ReviewStatus { get; init; }
+        public string ReviewNotes { get; init; } = string.Empty;
+        public DateTimeOffset CreatedTimestamp { get; init; }
     }
 
     private static void WriteHeaders(IXLWorksheet sheet, params string[] headers)

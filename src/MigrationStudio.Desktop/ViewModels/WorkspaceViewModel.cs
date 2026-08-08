@@ -1,29 +1,32 @@
-using System.Collections.ObjectModel;
-using System.Diagnostics;
-using System.IO;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
-using Microsoft.Extensions.Logging;
 using Microsoft.Data.SqlClient;
-using Npgsql;
-using MigrationStudio.Application.Discovery;
+using Microsoft.Extensions.Logging;
+using MigrationStudio.Application.Conversion;
 using MigrationStudio.Application.DataMigration;
 using MigrationStudio.Application.Deployment;
-using MigrationStudio.Application.Conversion;
+using MigrationStudio.Application.Discovery;
 using MigrationStudio.Application.Errors;
 using MigrationStudio.Application.Operations;
 using MigrationStudio.Application.Platform;
 using MigrationStudio.Application.Security;
 using MigrationStudio.Application.Validation;
-using MigrationStudio.Desktop.Dialogs;
+using MigrationStudio.Deployment;
 using MigrationStudio.Desktop.Collections;
+using MigrationStudio.Desktop.Dialogs;
 using MigrationStudio.Desktop.Threading;
-using MigrationStudio.Domain.Inventory;
 using MigrationStudio.Domain.Conversion;
 using MigrationStudio.Domain.DataMigration;
 using MigrationStudio.Domain.Deployment;
+using MigrationStudio.Domain.Inventory;
 using MigrationStudio.Domain.Operations;
 using MigrationStudio.Domain.Validation;
+using Npgsql;
+using System.Collections.ObjectModel;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Text;
 
 namespace MigrationStudio.Desktop.ViewModels;
 
@@ -76,6 +79,13 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
     private int _discoveryInFlight;
     private int _conversionInFlight;
     private int _deploymentInFlight;
+
+    private readonly object _deploymentProgressSync = new();
+    private DeploymentProgress? _pendingDeploymentProgress;
+    private int _deploymentProgressPumpRunning;
+    private long _deploymentProgressGeneration;
+    private static readonly TimeSpan DeploymentProgressUiInterval =
+        TimeSpan.FromMilliseconds(250);
 
     [ObservableProperty] private string _server = "localhost";
     [ObservableProperty] private int _port = 1433;
@@ -131,7 +141,8 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
     [ObservableProperty] private long _findingCount;
     [ObservableProperty] private long _unresolvedDependencyCount;
     [ObservableProperty] private int _targetPostgreSqlVersion = 17;
-    [ObservableProperty] private IdentifierCaseMode _identifierCaseMode =
+    [ObservableProperty]
+    private IdentifierCaseMode _identifierCaseMode =
         IdentifierCaseMode.QuoteOnlyWhenRequired;
     [ObservableProperty] private SchemaMappingMode _schemaMappingMode = SchemaMappingMode.Preserve;
     [ObservableProperty] private IdentityConversionStrategy _identityStrategy = IdentityConversionStrategy.GeneratedByDefaultAsIdentity;
@@ -152,7 +163,8 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
     [ObservableProperty] private TimeSpan? _conversionEstimatedRemaining;
     [ObservableProperty] private string _conversionOperationIdentifier = string.Empty;
     [ObservableProperty] private string _conversionMappingSetIdentifier = string.Empty;
-    [ObservableProperty] private string _identifierMappingStatus =
+    [ObservableProperty]
+    private string _identifierMappingStatus =
         "Identifier mapping is generated atomically during conversion.";
     [ObservableProperty] private int _selectedConversionTabIndex;
     [ObservableProperty] private int _automaticConversionCount;
@@ -172,6 +184,8 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
     [ObservableProperty] private int _liveValidationPassedCount;
     [ObservableProperty] private int _liveValidationFailedCount;
     [ObservableProperty] private int _liveValidationBlockedCount;
+    [ObservableProperty] private int _liveValidationHardBlockedCount;
+    [ObservableProperty] private int _liveValidationNonFatalBlockedCount;
     [ObservableProperty] private int _liveValidationNotRunCount;
     [ObservableProperty] private int _liveValidationManualReviewCount;
     [ObservableProperty] private int _liveValidationReusedCount;
@@ -1236,15 +1250,15 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
                     var completionFailures = ConversionCompletionBoundary.Execute(
                         () => { },
                         () => _dispatcher.Invoke(() =>
-                    {
-                        ApplyConversionRun(run);
-                        DeploymentPackagePath = string.Empty;
-                        IsBusy = false;
-                        ConversionStatus =
-                            $"Conversion complete · {run.Artifacts.Count:N0} artifacts · " +
-                            $"{mappingSummary.AutomaticallyMapped:N0} identifiers mapped · " +
-                            $"{mappingSummary.Unresolved:N0} unresolved · validate SQL to generate the deployment package";
-                    }));
+                        {
+                            ApplyConversionRun(run);
+                            DeploymentPackagePath = string.Empty;
+                            IsBusy = false;
+                            ConversionStatus =
+                                $"Conversion complete · {run.Artifacts.Count:N0} artifacts · " +
+                                $"{mappingSummary.AutomaticallyMapped:N0} identifiers mapped · " +
+                                $"{mappingSummary.Unresolved:N0} unresolved · validate SQL to generate the deployment package";
+                        }));
 
                     if (completionFailures.Count > 0)
                     {
@@ -1453,6 +1467,8 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
             LiveValidationPassedCount = 0;
             LiveValidationFailedCount = 0;
             LiveValidationBlockedCount = 0;
+            LiveValidationHardBlockedCount = 0;
+            LiveValidationNonFatalBlockedCount = 0;
             LiveValidationNotRunCount = 0;
             LiveValidationManualReviewCount = 0;
             LiveValidationReusedCount = 0;
@@ -1503,6 +1519,8 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
             LiveValidationPassedCount = workflow.PassedCount;
             LiveValidationFailedCount = workflow.FailedCount;
             LiveValidationBlockedCount = workflow.BlockedCount;
+            LiveValidationHardBlockedCount = workflow.Reconciliation.HardBlockedCount;
+            LiveValidationNonFatalBlockedCount = workflow.Reconciliation.NonFatalBlockedCount;
             LiveValidationNotRunCount = workflow.NotRunCount;
             LiveValidationManualReviewCount = workflow.ManualReviewCount;
             LiveValidationReusedCount = workflow.ReusedCount;
@@ -1517,10 +1535,7 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
             var confidence = updated.Select(item => item.Validation.Confidence)
                 .DefaultIfEmpty(LiveSqlValidationConfidence.None)
                 .Max();
-            var invalidDeployableCount = updated.Count(item =>
-                ConversionArtifactReconciler.IsDeployableExecutable(item) &&
-                !ConversionArtifactReconciler.HasCurrentSuccessfulLiveValidation(item));
-            if (invalidDeployableCount == 0)
+            if (workflow.Reconciliation.CanPublish)
             {
                 var packageRoot = Path.Combine(
                     _applicationPaths.ApplicationDataDirectory,
@@ -1531,15 +1546,20 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
                     cancellationToken);
                 DeploymentPackagePath = package;
                 LiveValidationStatus =
-                    $"Live PostgreSQL validation passed ({confidence}); validated package generated.";
+                    $"Live PostgreSQL validation passed with " +
+                    $"{workflow.Reconciliation.NonFatalBlockedCount:N0} nonfatal/deferred dependency warnings " +
+                    $"and {workflow.Reconciliation.HardBlockedCount:N0} hard blocks ({confidence}); " +
+                    "validated package generated.";
                 ConversionStatus = $"{LiveValidationStatus} Package: {package}";
             }
             else
             {
                 LiveValidationStatus =
                     $"Live PostgreSQL validation completed with " +
-                    $"{workflow.FailedCount:N0} failures, {workflow.BlockedCount:N0} dependency-blocked " +
-                    $"and {workflow.NotRunCount:N0} not-run artifacts ({confidence}).";
+                    $"{workflow.FailedCount:N0} failures, {workflow.BlockedCount:N0} originally dependency-blocked, " +
+                    $"{workflow.Reconciliation.HardBlockedCount:N0} fatal hard-blocked, " +
+                    $"{workflow.Reconciliation.NonFatalBlockedCount:N0} nonfatal/deferred, and " +
+                    $"{workflow.NotRunCount:N0} not-run artifacts ({confidence}).";
                 ConversionStatus = LiveValidationStatus;
             }
         }
@@ -1628,13 +1648,17 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
 
     internal static void EnsureAllDeployableArtifactsValidated(ConversionRun run)
     {
-        var missing =
-            ConversionArtifactReconciler.GetArtifactsWithoutCurrentSuccessfulLiveValidation(
-                run.Artifacts);
-        if (missing.Count > 0)
+        var planning = DeploymentPublicationReconciler.Reconcile(run);
+        if (!planning.Reconciliation.CanPublish)
         {
             throw new InvalidOperationException(
-                $"{missing.Count:N0} executable artifacts require successful live PostgreSQL validation before package generation.");
+                $"{planning.Reconciliation.NotRunExecutableCount:N0} executable artifacts require successful " +
+                "live PostgreSQL validation before package generation. Package publication is blocked: " +
+                $"failed={planning.Reconciliation.DirectValidationFailureCount:N0}, " +
+                $"hard-blocked={planning.Reconciliation.HardBlockedCount:N0}, " +
+                $"not-run={planning.Reconciliation.NotRunExecutableCount:N0}, " +
+                $"hard-cycles={planning.Reconciliation.HardCycleCount:N0}, " +
+                $"unresolved={planning.Reconciliation.UnresolvedInternalDependencyCount:N0}.");
         }
     }
 
@@ -1652,17 +1676,19 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
 
     private void EnsureValidatedForPackageGeneration(ConversionRun run)
     {
-        var missing =
-            ConversionArtifactReconciler.GetArtifactsWithoutCurrentSuccessfulLiveValidation(
-                run.Artifacts);
-        if (missing.Count > 0)
+        var planning = DeploymentPublicationReconciler.Reconcile(run);
+        if (!planning.Reconciliation.CanPublish)
         {
             LogPackageExportBlocked(
-                missing.Count,
+                planning.Reconciliation.HardBlockedCount +
+                planning.Reconciliation.DirectValidationFailureCount +
+                planning.Reconciliation.NotRunExecutableCount,
                 string.Join(
                     ", ",
-                    missing.Take(25).Select(item =>
-                        item.TargetObjectId.QualifiedName)));
+                    planning.Reconciliation.ArtifactDecisions
+                        .Where(item => item.IsFatal)
+                        .Take(25)
+                        .Select(item => item.TargetQualifiedName)));
         }
         EnsureAllDeployableArtifactsValidated(run);
     }
@@ -1681,17 +1707,26 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
             package,
             diagnosticMode: false,
             cancellationToken).ConfigureAwait(false);
+        var nonFatalBlocked = (manifest.BlockedDependencyReconciliation?.ArtifactDecisions ?? [])
+            .Where(item => !item.IsFatal &&
+                           item.ReconciledClassification !=
+                           ReconciledBlockedClassification.DeferredByDeploymentPlan)
+            .Select(item => $"{item.SourceObjectId}|{item.TargetQualifiedName}")
+            .ToHashSet(StringComparer.Ordinal);
         var invalid = manifest.Artifacts.Count(item =>
             item.IsExecutable &&
             !item.RequiresManualReview &&
             item.Classification != ConversionClassification.Unsupported &&
-            (item.LiveValidation.Outcome != LiveSqlValidationOutcome.Passed ||
-             !item.LiveValidation.WasLiveValidated ||
-             !item.LiveValidation.IsStructurallyValid ||
-             !string.Equals(
-    item.LiveValidation.ValidatedSqlHash,
-    item.SqlSha256,
-    StringComparison.OrdinalIgnoreCase)));
+            !((item.LiveValidation.Outcome == LiveSqlValidationOutcome.Passed &&
+               item.LiveValidation.WasLiveValidated &&
+               item.LiveValidation.IsStructurallyValid &&
+               string.Equals(
+                   item.LiveValidation.ValidatedSqlHash,
+                   item.SqlSha256,
+                   StringComparison.OrdinalIgnoreCase)) ||
+              item.LiveValidation.Outcome == LiveSqlValidationOutcome.BlockedByDependency &&
+              nonFatalBlocked.Contains(
+                  $"{item.SourceObjectId}|{item.TargetSchema}.{item.TargetName}")));
         if (invalid > 0)
         {
             throw new InvalidDataException(
@@ -1920,11 +1955,11 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
             DataMigrationStatus = resume
                 ? $"Queued resume for {plan.RunId}{RecoveryStatus(plan)}"
                 : $"Queued migration {plan.RunId}{RecoveryStatus(plan)}";
-                        var deployment = CreateDeploymentConnection();
+            var deployment = CreateDeploymentConnection();
 
-                        var definition = new BackgroundOperationDefinition(
-                $"Migrate data to {deployment.TargetDatabase}",
-                            async (context, cancellationToken) =>
+            var definition = new BackgroundOperationDefinition(
+    $"Migrate data to {deployment.TargetDatabase}",
+                async (context, cancellationToken) =>
                 {
                     try
                     {
@@ -1938,37 +1973,36 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
                             }
 
                             context.Report(new OperationProgress(
-                                item.Percentage,
-                                item.Message,
-                                item.RowsWritten,
-                                totalUnits));
+                                            item.Percentage,
+                                            item.Message,
+                                            item.RowsWritten,
+                                            totalUnits));
 
                             _dispatcher.Invoke(() => ApplyDataProgress(item));
                         });
                         var result = resume
-                            ? await _dataMigrationEngine.ResumeAsync(
-                                request,
-                                reporter,
-                                cancellationToken)
-                            : await _dataMigrationEngine.ExecuteAsync(
-                                request,
-                                reporter,
-                                cancellationToken);
+                                        ? await _dataMigrationEngine.ResumeAsync(
+                                            request,
+                                            reporter,
+                                            cancellationToken)
+                                        : await _dataMigrationEngine.ExecuteAsync(
+                                            request,
+                                            reporter,
+                                            cancellationToken);
                         _dispatcher.Invoke(() =>
                         {
                             ApplyDataResult(result);
                             IsBusy = false;
                         });
                         if (result.State is MigrationRunState.Failed or
-                            MigrationRunState.CompletedWithFailures ||
-                            result.Failures.Any(item =>
-                                item.Disposition is FailureDisposition.TableStopped or
-                                    FailureDisposition.MigrationStopped))
+         MigrationRunState.CompletedWithFailures ||
+     result.Failures.Any(item =>
+         item.Disposition is FailureDisposition.TableStopped or
+             FailureDisposition.MigrationStopped))
                         {
-                            throw new InvalidOperationException(
-                                $"Data migration ended as {result.State} with " +
-                                $"{result.Failures.Count:N0} recorded failures. " +
-                                "Review the retained checkpoint and streaming diagnostics.");
+                            var message = BuildMigrationFailureMessage(result);
+
+                            throw new InvalidOperationException(message);
                         }
                     }
                     catch (Exception exception)
@@ -1983,7 +2017,7 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
                             else
                             {
                                 DataMigrationStatus =
-                                    "Data migration failed. Review operation logs and the last checkpoint.";
+                                                "Data migration failed. Review operation logs and the last checkpoint.";
                             }
                         });
                         throw;
@@ -1998,7 +2032,168 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
         }
     }
 
-    private async Task EnsureCurrentIdentifierMappingSetAsync()
+
+private static string BuildMigrationFailureMessage(
+    DataMigrationResult result)
+    {
+        var builder = new StringBuilder();
+
+        builder.AppendFormat(
+            CultureInfo.InvariantCulture,
+            "Data migration ended as {0} with {1:N0} recorded failure(s).",
+            result.State,
+            result.Failures.Count);
+
+        foreach (var failure in result.Failures.Take(10))
+        {
+            builder.AppendLine();
+            builder.AppendLine();
+
+            builder.AppendFormat(
+                CultureInfo.InvariantCulture,
+                "Table       : {0}",
+                failure.Table);
+            builder.AppendLine();
+
+            builder.AppendFormat(
+                CultureInfo.InvariantCulture,
+                "Batch       : {0}",
+                failure.Batch);
+            builder.AppendLine();
+
+            if (failure.RowOrdinal.HasValue)
+            {
+                builder.AppendFormat(
+                    CultureInfo.InvariantCulture,
+                    "Row         : {0}",
+                    failure.RowOrdinal.Value);
+                builder.AppendLine();
+            }
+
+            if (!string.IsNullOrWhiteSpace(failure.SqlState))
+            {
+                builder.AppendFormat(
+                    CultureInfo.InvariantCulture,
+                    "SQLSTATE    : {0}",
+                    failure.SqlState);
+                builder.AppendLine();
+            }
+
+            builder.AppendFormat(
+                CultureInfo.InvariantCulture,
+                "Category    : {0}",
+                failure.Category);
+            builder.AppendLine();
+
+            builder.AppendFormat(
+                CultureInfo.InvariantCulture,
+                "Disposition : {0}",
+                failure.Disposition);
+            builder.AppendLine();
+
+            builder.AppendFormat(
+                CultureInfo.InvariantCulture,
+                "Error       : {0}",
+                failure.SanitizedMessage);
+        }
+
+        var failedStage = result.StreamingStages
+            .Where(item =>
+                item.Outcome == StreamingStageOutcome.Failed)
+            .OrderByDescending(item => item.StartedAt)
+            .FirstOrDefault();
+
+        if (failedStage is not null)
+        {
+            builder.AppendLine();
+            builder.AppendLine();
+            builder.AppendLine("Streaming failure:");
+
+            builder.AppendFormat(
+                CultureInfo.InvariantCulture,
+                "Stage       : {0}: {1}",
+                (int)failedStage.Stage,
+                failedStage.Stage);
+            builder.AppendLine();
+
+            if (!string.IsNullOrWhiteSpace(failedStage.SourceTable))
+            {
+                builder.AppendFormat(
+                    CultureInfo.InvariantCulture,
+                    "Source      : {0}",
+                    failedStage.SourceTable);
+                builder.AppendLine();
+            }
+
+            if (!string.IsNullOrWhiteSpace(failedStage.TargetTable))
+            {
+                builder.AppendFormat(
+                    CultureInfo.InvariantCulture,
+                    "Target      : {0}",
+                    failedStage.TargetTable);
+                builder.AppendLine();
+            }
+
+            if (!string.IsNullOrWhiteSpace(failedStage.FailureComponent))
+            {
+                builder.AppendFormat(
+                    CultureInfo.InvariantCulture,
+                    "Component   : {0}",
+                    failedStage.FailureComponent);
+                builder.AppendLine();
+            }
+
+            if (!string.IsNullOrWhiteSpace(failedStage.SqlState))
+            {
+                builder.AppendFormat(
+                    CultureInfo.InvariantCulture,
+                    "SQLSTATE    : {0}",
+                    failedStage.SqlState);
+                builder.AppendLine();
+            }
+
+            if (!string.IsNullOrWhiteSpace(failedStage.FailureReason))
+            {
+                builder.AppendFormat(
+                    CultureInfo.InvariantCulture,
+                    "Reason      : {0}",
+                    failedStage.FailureReason);
+                builder.AppendLine();
+            }
+
+            if (!string.IsNullOrWhiteSpace(failedStage.Remediation))
+            {
+                builder.AppendFormat(
+                    CultureInfo.InvariantCulture,
+                    "Remediation : {0}",
+                    failedStage.Remediation);
+            }
+        }
+
+        if (result.Failures.Count > 10)
+        {
+            builder.AppendLine();
+            builder.AppendLine();
+
+            builder.AppendFormat(
+                CultureInfo.InvariantCulture,
+                "{0:N0} additional failure(s) were recorded.",
+                result.Failures.Count - 10);
+        }
+
+        builder.AppendLine();
+        builder.AppendLine();
+
+        builder.AppendFormat(
+            CultureInfo.InvariantCulture,
+            "Checkpoint: {0}",
+            result.CheckpointPath);
+
+        return builder.ToString();
+    }
+
+
+  private async Task EnsureCurrentIdentifierMappingSetAsync()
     {
         if (_session.Current is null || _conversionSession.Current is null)
         {
@@ -2514,7 +2709,7 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
         {
             var request = CreateValidationRequest();
             IsBusy = true;
-           // ValidationStatus = "Validation queued.";
+            // ValidationStatus = "Validation queued.";
             ValidationStatus =
     "Validation queued. Foreign keys will be added and validated first.";
             /*            var definition = new BackgroundOperationDefinition(
@@ -2690,16 +2885,15 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
 
 
     private async Task<DeploymentResult> DeployAndValidateForeignKeysAsync(
-    IProgress<DeploymentProgress>? progress,
-    CancellationToken cancellationToken)
+       IProgress<DeploymentProgress>? progress,
+       CancellationToken cancellationToken)
     {
-        var request = CreateDeploymentRequest(
+        var baseRequest = CreateDeploymentRequest(
             scopeOverride: DeploymentScope.SelectedPhases,
             selectedPhasesOverride: ForeignKeyDeploymentPhases,
 
-            // This strategy:
-            // 1. Adds FK constraints as NOT VALID.
-            // 2. Validates them during post-deployment processing.
+            // Add foreign keys as NOT VALID first.
+            // Existing legacy rows are then checked during validation.
             constraintStrategyOverride:
                 ConstraintDeploymentStrategy.AddNotValidThenValidate,
 
@@ -2710,25 +2904,79 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
             vacuumAnalyzeOverride: false,
             installExtensionsOverride: false,
 
-            // Useful if validation is run again after the FKs already exist.
+            // Allows rerunning validation when an equivalent FK already exists.
             conflictPolicyOverride:
                 ExistingObjectConflictPolicy.SkipWhenEquivalent);
+
+        /*
+         * Important:
+         *
+         * For the FK-only validation stage we do not want one bad FK
+         * to terminate processing of all remaining independent FKs.
+         *
+         * ContinueIndependentObjects allows the deployment engine to:
+         *
+         *  - record the failing FK,
+         *  - preserve successful FK deployments,
+         *  - continue with unrelated FK constraints.
+         */
+        var request = baseRequest with
+        {
+            Options = baseRequest.Options with
+            {
+                ErrorPolicy =
+                    DeploymentErrorPolicy.ContinueIndependentObjects
+            }
+        };
 
         var result = await _deploymentEngine.DeployAsync(
             request,
             progress,
             cancellationToken).ConfigureAwait(false);
 
-        if (result.Status == DeploymentRunStatus.Failed ||
-            result.Objects.Any(item =>
+        var failed = result.Objects
+            .Where(item =>
+                item.Status == DeploymentObjectStatus.Failed)
+            .ToArray();
+
+        var blocked = result.Objects
+            .Where(item =>
                 item.Status is
-                    DeploymentObjectStatus.Failed or
                     DeploymentObjectStatus.Blocked or
-                    DeploymentObjectStatus.BlockedByDependency))
+                    DeploymentObjectStatus.BlockedByDependency)
+            .ToArray();
+
+        /*
+         * Do NOT throw merely because individual FK constraints failed.
+         *
+         * The deployment engine has already:
+         *
+         *  - recorded those failures in the deployment result/journal,
+         *  - retained successfully deployed foreign keys,
+         *  - continued processing independent objects.
+         *
+         * Returning the result allows the normal post-migration
+         * validation stage to continue.
+         */
+        if (failed.Length > 0 || blocked.Length > 0)
         {
-            throw new InvalidOperationException(
-                "Foreign-key deployment or validation failed. " +
-                $"The deployment journal contains {result.Failures.Count:N0} failure(s).");
+            _dispatcher.Invoke(() =>
+            {
+                ValidationStatus =
+                    "Foreign-key processing completed with exceptions. " +
+                    $"Failed: {failed.Length:N0}, " +
+                    $"Blocked: {blocked.Length:N0}. " +
+                    "Successful foreign keys were retained; " +
+                    "post-migration validation will continue.";
+            });
+        }
+        else
+        {
+            _dispatcher.Invoke(() =>
+            {
+                ValidationStatus =
+                    "Foreign keys added and validated successfully.";
+            });
         }
 
         return result;
@@ -2991,10 +3239,7 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
                                         completed,
                                         effectiveTotal));
 
-                                _dispatcher.Invoke(() =>
-                                {
-                                    ApplyDeploymentProgress(item);
-                                });
+                                QueueDeploymentProgressUpdate(item);
                             });
 
                         DeploymentResult result;
@@ -3153,6 +3398,7 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
                     {
                         _dispatcher.Invoke(() =>
                         {
+                            StopDeploymentProgressUpdates();
                             IsBusy = false;
 
                             Interlocked.Exchange(
@@ -3536,6 +3782,108 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
     }
 
 
+    private void QueueDeploymentProgressUpdate(
+        DeploymentProgress progress)
+    {
+        lock (_deploymentProgressSync)
+        {
+            _pendingDeploymentProgress = progress;
+        }
+
+        if (Interlocked.CompareExchange(
+                ref _deploymentProgressPumpRunning,
+                1,
+                0) != 0)
+        {
+            return;
+        }
+
+        var generation = Interlocked.Read(
+            ref _deploymentProgressGeneration);
+
+        _ = PumpDeploymentProgressAsync(generation);
+    }
+
+    private async Task PumpDeploymentProgressAsync(
+        long generation)
+    {
+        try
+        {
+            while (generation ==
+                   Interlocked.Read(ref _deploymentProgressGeneration))
+            {
+                await Task.Delay(DeploymentProgressUiInterval)
+                    .ConfigureAwait(false);
+
+                DeploymentProgress? latest;
+
+                lock (_deploymentProgressSync)
+                {
+                    latest = _pendingDeploymentProgress;
+                    _pendingDeploymentProgress = null;
+                }
+
+                if (latest is null)
+                {
+                    break;
+                }
+
+                _dispatcher.Post(() =>
+                {
+                    if (generation ==
+                        Interlocked.Read(
+                            ref _deploymentProgressGeneration))
+                    {
+                        ApplyDeploymentProgress(latest);
+                    }
+                });
+            }
+        }
+        finally
+        {
+            Interlocked.Exchange(
+                ref _deploymentProgressPumpRunning,
+                0);
+
+            bool hasPending;
+
+            lock (_deploymentProgressSync)
+            {
+                hasPending =
+                    _pendingDeploymentProgress is not null;
+            }
+
+            if (hasPending &&
+                generation ==
+                Interlocked.Read(
+                    ref _deploymentProgressGeneration))
+            {
+                DeploymentProgress? pending;
+
+                lock (_deploymentProgressSync)
+                {
+                    pending = _pendingDeploymentProgress;
+                }
+
+                if (pending is not null)
+                {
+                    QueueDeploymentProgressUpdate(pending);
+                }
+            }
+        }
+    }
+
+    private void StopDeploymentProgressUpdates()
+    {
+        Interlocked.Increment(
+            ref _deploymentProgressGeneration);
+
+        lock (_deploymentProgressSync)
+        {
+            _pendingDeploymentProgress = null;
+        }
+    }
+
     private void ApplyDeploymentProgress(
         DeploymentProgress progress)
     {
@@ -3546,44 +3894,108 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
             0,
             Math.Max(total, progress.Completed));
 
-        DeploymentId =
+        var deploymentId =
             progress.DeploymentId.ToString();
 
-        DeploymentCurrentObject =
+        var currentObject =
             progress.CurrentObject ?? string.Empty;
 
-        DeploymentStatus =
+        var status =
             $"{progress.Phase}: {progress.Message}";
 
-        DeploymentCompleted = completed;
-        DeploymentFailed = Math.Max(0, progress.Failed);
-        DeploymentSkipped = Math.Max(0, progress.Skipped);
+        var failed =
+            Math.Max(0, progress.Failed);
 
-        DeploymentProgress = Math.Clamp(
-            progress.Percentage,
-            0,
-            100);
+        var skipped =
+            Math.Max(0, progress.Skipped);
+
+        var percentage =
+            Math.Clamp(progress.Percentage, 0, 100);
+
+        if (!string.Equals(
+                DeploymentId,
+                deploymentId,
+                StringComparison.Ordinal))
+        {
+            DeploymentId = deploymentId;
+        }
+
+        if (!string.Equals(
+                DeploymentCurrentObject,
+                currentObject,
+                StringComparison.Ordinal))
+        {
+            DeploymentCurrentObject = currentObject;
+        }
+
+        if (!string.Equals(
+                DeploymentStatus,
+                status,
+                StringComparison.Ordinal))
+        {
+            DeploymentStatus = status;
+        }
+
+        if (DeploymentCompleted != completed)
+        {
+            DeploymentCompleted = completed;
+        }
+
+        if (DeploymentFailed != failed)
+        {
+            DeploymentFailed = failed;
+        }
+
+        if (DeploymentSkipped != skipped)
+        {
+            DeploymentSkipped = skipped;
+        }
+
+        if (Math.Abs(
+                DeploymentProgress - percentage) > 0.01)
+        {
+            DeploymentProgress = percentage;
+        }
 
         var phase =
             DeploymentPhases.FirstOrDefault(item =>
                 item.Phase == progress.Phase);
 
-        if (phase is not null)
+        if (phase is null)
+        {
+            return;
+        }
+
+        if (phase.Completed != completed)
         {
             phase.Completed = completed;
-            phase.Failed = Math.Max(0, progress.Failed);
-            phase.Skipped = Math.Max(0, progress.Skipped);
+        }
 
-            phase.Status =
-                progress.Failed > 0
-                    ? DeploymentObjectStatus.Failed
-                    : DeploymentObjectStatus.Running;
+        if (phase.Failed != failed)
+        {
+            phase.Failed = failed;
+        }
+
+        if (phase.Skipped != skipped)
+        {
+            phase.Skipped = skipped;
+        }
+
+        var phaseStatus =
+            failed > 0
+                ? DeploymentObjectStatus.Failed
+                : DeploymentObjectStatus.Running;
+
+        if (phase.Status != phaseStatus)
+        {
+            phase.Status = phaseStatus;
         }
     }
 
     private void ApplyDeploymentResult(
         DeploymentResult result)
     {
+        StopDeploymentProgressUpdates();
         _deploymentResult = result;
 
         DeploymentId =
@@ -3776,6 +4188,8 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
         LiveValidationPassedCount = 0;
         LiveValidationFailedCount = 0;
         LiveValidationBlockedCount = 0;
+        LiveValidationHardBlockedCount = 0;
+        LiveValidationNonFatalBlockedCount = 0;
         LiveValidationNotRunCount = 0;
         LiveValidationManualReviewCount = 0;
         LiveValidationReusedCount = 0;
@@ -3848,6 +4262,8 @@ public sealed partial class WorkspaceViewModel : ObservableObject, IDisposable
         LiveValidationPassedCount = 0;
         LiveValidationFailedCount = 0;
         LiveValidationBlockedCount = 0;
+        LiveValidationHardBlockedCount = 0;
+        LiveValidationNonFatalBlockedCount = 0;
         LiveValidationNotRunCount = 0;
         LiveValidationManualReviewCount = 0;
         LiveValidationReusedCount = 0;

@@ -1,0 +1,23 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>Pragmastat</id>
+    <version>3.2.4</version>
+    <authors>Andrey Akinshin</authors>
+    <license type="expression">MIT</license>
+    <licenseUrl>https://licenses.nuget.org/MIT</licenseUrl>
+    <icon>logo.png</icon>
+    <readme>README.md</readme>
+    <projectUrl>https://pragmastat.dev/</projectUrl>
+    <description>Pragmatic Statistical Toolkit</description>
+    <copyright>Copyright (C) 2025 Andrey Akinshin</copyright>
+    <tags>statistics</tags>
+    <repository type="git" url="https://github.com/AndreyAkinshin/pragmastat" commit="27b768a9612909dd80dca584f3d71d5208fbb953" />
+    <dependencies>
+      <group targetFramework="net6.0" />
+      <group targetFramework=".NETStandard2.0">
+        <dependency id="System.Memory" version="4.5.5" exclude="Build,Analyzers" />
+      </group>
+    </dependencies>
+  </metadata>
+</package>

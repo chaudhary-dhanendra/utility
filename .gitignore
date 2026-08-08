@@ -1,8 +1,238 @@
+# ============================================================
+# MigrationStudio - .gitignore
+# .NET 8 / WPF / Visual Studio / WiX
+# ============================================================
+
+
+# ------------------------------------------------------------
+# Visual Studio
+# ------------------------------------------------------------
 .vs/
-.packages/
-**/bin/
-**/obj/
-TestResults/
 *.user
 *.suo
+*.userosscache
+*.sln.docstates
+*.userprefs
+*.rsuser
+
+# Visual Studio temporary files
+*.VC.db
+*.VC.VC.opendb
+*.opendb
+*.sdf
+*.cachefile
+
+
+# ------------------------------------------------------------
+# .NET build output
+# ------------------------------------------------------------
+[Bb]in/
+[Oo]bj/
+artifacts/
+
+**/bin/
+**/obj/
+
+
+# ------------------------------------------------------------
+# Publish output
+# ------------------------------------------------------------
+publish/
+Publish/
+**/publish/
+**/Publish/
+
+*.publish.xml
+*.pubxml.user
+
+
+# ------------------------------------------------------------
+# Release / Debug output
+# ------------------------------------------------------------
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+
+
+# ------------------------------------------------------------
+# NuGet
+# ------------------------------------------------------------
+*.nupkg
+*.snupkg
+packages/
+.nuget/
+
+# Keep NuGet configuration
+!NuGet.Config
+
+
+# ------------------------------------------------------------
+# Test results / coverage
+# ------------------------------------------------------------
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+coverage/
+coverage.*
+BenchmarkDotNet.Artifacts/
+
+
+# ------------------------------------------------------------
+# Logs
+# ------------------------------------------------------------
 *.log
+logs/
+Logs/
+**/logs/
+**/Logs/
+
+
+# ------------------------------------------------------------
+# MigrationStudio runtime-generated data
+# ------------------------------------------------------------
+run-history/
+diagnostics/
+checkpoints/
+temp/
+tmp/
+
+**/run-history/
+**/diagnostics/
+**/checkpoints/
+**/temp/
+**/tmp/
+
+
+# ------------------------------------------------------------
+# Migration packages / generated migration artifacts
+# ------------------------------------------------------------
+*.zip
+
+migration-packages/
+MigrationPackages/
+**/migration-packages/
+**/MigrationPackages/
+
+
+# ------------------------------------------------------------
+# Database dumps / backups
+# ------------------------------------------------------------
+*.bak
+*.backup
+*.dump
+*.dmp
+
+
+# ------------------------------------------------------------
+# Installer build output
+# ------------------------------------------------------------
+*.msi
+*.msix
+*.msm
+*.msp
+*.wixobj
+*.wixpdb
+*.wixout
+
+installer/**/bin/
+installer/**/obj/
+
+
+# ------------------------------------------------------------
+# JetBrains Rider / ReSharper
+# ------------------------------------------------------------
+.idea/
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+
+
+# ------------------------------------------------------------
+# VS Code
+# ------------------------------------------------------------
+.vscode/
+
+# Keep shared VS Code configuration if intentionally committed
+# !.vscode/settings.json
+# !.vscode/tasks.json
+# !.vscode/launch.json
+
+
+# ------------------------------------------------------------
+# OS generated
+# ------------------------------------------------------------
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+
+# ------------------------------------------------------------
+# Temporary / backup files
+# ------------------------------------------------------------
+*.tmp
+*.temp
+*.bak~
+*.old
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+~$*
+
+
+# ------------------------------------------------------------
+# Crash dumps
+# ------------------------------------------------------------
+*.dmp
+*.mdmp
+
+
+# ------------------------------------------------------------
+# Generated executables / symbols
+# ------------------------------------------------------------
+*.pdb
+
+# Do NOT globally ignore *.exe or *.dll because repository
+# dependencies/tools may intentionally contain binaries.
+
+
+# ------------------------------------------------------------
+# Local environment / secrets
+# ------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+secrets.json
+appsettings.Local.json
+appsettings.Development.local.json
+
+
+# ------------------------------------------------------------
+# Certificates / signing keys
+# ------------------------------------------------------------
+*.pfx
+*.p12
+*.key
+*.cer
+*.pem
+
+
+# ------------------------------------------------------------
+# MigrationStudio large/generated analysis output
+# ------------------------------------------------------------
+diagnostics/
+reports/generated/
+migration-output/
+deployment-output/
+
+**/diagnostics/
+**/reports/generated/
+**/migration-output/
+**/deployment-output/

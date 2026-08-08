@@ -41,8 +41,8 @@ public sealed partial class ProgrammableObjectConverter(
             ModuleKind.View => ConvertView(source, module, context),
             ModuleKind.ScalarFunction => ConvertScalarFunction(source, module, context),
             ModuleKind.InlineTableValuedFunction => ConvertInlineFunction(source, module, context),
-            ModuleKind.MultiStatementTableValuedFunction => ManualSkeleton(
-                source, context, module, "Multi-statement table-valued functions require procedural and return-table review.", "multi-statement TVF"),
+            ModuleKind.MultiStatementTableValuedFunction => ConvertMultiStatementTableFunction(
+                source, module, context),
             ModuleKind.StoredProcedure => ConvertProcedure(source, module, context),
             ModuleKind.DmlTrigger => ConvertTrigger(source, module, context),
             ModuleKind.DdlTrigger or ModuleKind.ServerTrigger => ManualSkeleton(
@@ -93,11 +93,53 @@ public sealed partial class ProgrammableObjectConverter(
                 unsupported.ToArray());
         }
 
+        var unresolvedRelations = context.Inventory.Dependencies
+            .Where(item =>
+                item.SourceObjectId == source.Id &&
+                item.TargetObjectId is null &&
+                !item.IsResolved &&
+                IsUnqualifiedRelationReference(body, item.ReferencedName))
+            .Select(item => item.ReferencedName)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (unresolvedRelations.Length > 0)
+        {
+            return ConversionRuleSupport.Manual(
+                source,
+                "View relation references could not be resolved through the central identifier map.",
+                $"CREATE OR REPLACE VIEW {context.Identifiers.MapObject(source).QualifiedName} AS SELECT NULL::text AS manual_review WHERE false;",
+                unresolvedRelations.Select(item => $"unresolved relation {item}").ToArray());
+        }
+
         return ConversionRuleSupport.Success(
             $"CREATE OR REPLACE VIEW {context.Identifiers.MapObject(source).QualifiedName} AS{Environment.NewLine}{transformed.Trim().TrimEnd(';')};",
             "VIEW.STRUCTURED",
             classification: ConversionClassification.AutomaticWithWarning,
             confidence: 0.8m);
+    }
+
+    private static bool IsUnqualifiedRelationReference(string sql, string referencedName)
+    {
+        var tokens = TSqlTokenizer.Tokenize(sql).ToList();
+        for (var index = 0; index < tokens.Count; index++)
+        {
+            if (tokens[index].Kind != TSqlTokenKind.Word ||
+                tokens[index].Text.ToUpperInvariant() is not ("FROM" or "JOIN"))
+            {
+                continue;
+            }
+            var relation = NextSignificant(tokens, index);
+            var dot = relation >= 0 ? NextSignificant(tokens, relation) : -1;
+            if (relation >= 0 &&
+                IsIdentifier(tokens[relation]) &&
+                !tokens[relation].Text.Contains('.', StringComparison.Ordinal) &&
+                (dot < 0 || tokens[dot].Text != ".") &&
+                Unquote(tokens[relation].Text).Equals(referencedName, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static ConversionResult<string> ConvertScalarFunction(
@@ -254,25 +296,72 @@ public sealed partial class ProgrammableObjectConverter(
         var body = ExtractAfterAs(source.SourceDefinition!);
         var unsupported = new List<string>();
         if (body is null ||
-            ContainsAny(body, "RAISERROR", "THROW", "BEGIN TRY", "BEGIN CATCH", "CURSOR", "MERGE", "OUTPUT", "EXEC(", "SP_EXECUTESQL", "#", " TABLE ", "WHILE "))
+            ContainsAny(body, "RAISERROR", "THROW", "BEGIN TRY", "BEGIN CATCH", "CURSOR", "MERGE", "OUTPUT", "SP_EXECUTESQL", "#", " TABLE ", "WHILE "))
         {
             unsupported.Add("procedural construct requiring PL/pgSQL review");
-        }
-        if (module.ContainsDynamicSql)
-        {
-            unsupported.Add("dynamic SQL");
         }
         if (module.UsesTemporaryTables)
         {
             unsupported.Add("temporary tables");
+        }
+        if (body is not null && ContainsWord(body, "IF"))
+        {
+            unsupported.Add("procedure IF/ELSE control flow");
+        }
+        if (body is not null && ContainsWord(body, "RETURN"))
+        {
+            unsupported.Add("procedure RETURN contract");
         }
         if (unsupported.Count > 0 || body is null)
         {
             return ManualSkeleton(source, context, module, "Stored procedure semantics cannot be converted safely without manual review.", unsupported.ToArray());
         }
 
+        if (HasUpdateTargetingCte(body))
+        {
+            return ManualSkeleton(
+                source,
+                context,
+                module,
+                "SQL Server updatable CTE semantics cannot be preserved safely as PostgreSQL.",
+                "updatable CTE");
+        }
+
+        if (ContainsResultSetSelect(body))
+        {
+            return ConvertResultSetProcedure(source, module, context, body);
+        }
+
+        var proceduralBody = StripBeginEnd(body.Trim().TrimEnd(';'));
+        if (!TryExtractProcedureLocals(
+                proceduralBody,
+                source,
+                module,
+                context,
+                out proceduralBody,
+                out var declarations,
+                out var localTypes,
+                out var localError))
+        {
+            return ManualSkeleton(source, context, module, localError, "local variable declaration");
+        }
+        proceduralBody = RemoveRedundantProcedureBlocks(proceduralBody);
+        if (!TryTranslateDynamicExecute(proceduralBody, localTypes, out proceduralBody))
+        {
+            return ManualSkeleton(
+                source,
+                context,
+                module,
+                "Dynamic SQL could not be proven to use a declared, parameterized expression.",
+                "dynamic SQL");
+        }
+
+        // SQL Server permits INSERT <target>; add PostgreSQL's required INTO before
+        // TransformBody maps the target identifier.
+        proceduralBody = EnsurePostgreSqlInsertInto(proceduralBody);
+
         var transformed = TransformBody(
-            body,
+            proceduralBody,
             source,
             module,
             context,
@@ -281,26 +370,37 @@ public sealed partial class ProgrammableObjectConverter(
         {
             return ManualSkeleton(source, context, module, "Stored procedure contains unsupported expressions.", translationUnsupported.ToArray());
         }
-        if (ContainsResultSetSelect(body))
+        transformed = RemoveSqlServerSessionStatements(transformed);
+        transformed = TranslatePrintStatements(transformed, localTypes);
+        transformed = TranslateCompoundAssignments(transformed, localTypes);
+        transformed = TranslateSimpleAssignments(transformed, localTypes.Keys);
+        transformed = TranslateSelectAssignments(transformed, localTypes.Keys);
+        transformed = EnsurePostgreSqlInsertInto(transformed);
+        transformed = TerminateAdjacentProcedureDmlStatements(transformed);
+        transformed = EnsureFinalStatementTerminator(transformed);
+        var localNames = localTypes.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var declarationSql = declarations.Count == 0
+            ? string.Empty
+            : $"DECLARE{Environment.NewLine}" +
+              string.Join(Environment.NewLine, declarations.Select(item =>
+                  $"    {item.TargetName} {item.TargetType}" +
+                  (item.Initializer is null ? ";" : $" := {item.Initializer};"))) +
+              Environment.NewLine;
+        var rewrittenBody = RewriteVariables(transformed, module, localNames);
+        if (HasResidualProceduralSyntax(rewrittenBody))
         {
             return ManualSkeleton(
                 source,
                 context,
                 module,
-                "Stored procedure returns a SQL Server result set; choose a PostgreSQL refcursor, OUT parameters, or a set-returning function.",
-                "result-set SELECT interface");
+                "Stored procedure contains residual SQL Server procedural syntax after structured translation.",
+                "residual procedural syntax");
         }
-        transformed = RemoveSqlServerSessionStatements(transformed);
-        transformed = TranslateSelectAssignments(StripBeginEnd(transformed));
         var sql = $"CREATE OR REPLACE PROCEDURE {context.Identifiers.MapObject(source).QualifiedName}" +
                   $"({BuildParameters(module, context)}){Environment.NewLine}" +
                   $"LANGUAGE plpgsql{Environment.NewLine}AS $migrationstudio${Environment.NewLine}" +
-                  $"BEGIN{Environment.NewLine}{Indent(
-                      RewriteVariables(
-                          transformed,
-                          module,
-                          new HashSet<string>(StringComparer.OrdinalIgnoreCase)),
-                      4)}{Environment.NewLine}" +
+                  declarationSql +
+                  $"BEGIN{Environment.NewLine}{Indent(rewrittenBody, 4)}{Environment.NewLine}" +
                   $"END;{Environment.NewLine}$migrationstudio$;";
         return ConversionRuleSupport.Success(
             sql,
@@ -315,13 +415,741 @@ public sealed partial class ProgrammableObjectConverter(
             @"(?im)^\s*SELECT\s+(?!@\w+\s*=)",
             RegexOptions.CultureInvariant);
 
-    private static string TranslateSelectAssignments(string body) =>
+    private static string TranslateSelectAssignments(
+        string body,
+        IEnumerable<string>? localNames = null)
+    {
+        var locals = localNames?.ToHashSet(StringComparer.OrdinalIgnoreCase) ??
+                     new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        return
         Regex.Replace(
             body,
-            @"(?im)^\s*SELECT\s+@(?<variable>\w+)\s*=\s*(?<expression>.+?);\s*$",
+            @"(?im)^\s*SELECT\s+@(?<variable>\w+)\s*=\s*(?<expression>.+?)(?<terminator>;\s*$|$)",
             match =>
-                $"SELECT {match.Groups["expression"].Value} INTO p_{match.Groups["variable"].Value};",
+                $"SELECT {match.Groups["expression"].Value} INTO " +
+                (locals.Contains(match.Groups["variable"].Value) ? "v_" : "p_") +
+                $"{match.Groups["variable"].Value.ToLowerInvariant()};",
             RegexOptions.CultureInvariant);
+    }
+
+    private static string EnsureFinalStatementTerminator(string body)
+    {
+        var tokens = TSqlTokenizer.Tokenize(body).ToList();
+        var last = PreviousSignificant(tokens, tokens.Count);
+        if (last < 0)
+        {
+            return body.TrimEnd();
+        }
+        if (tokens[last].Text != ";")
+        {
+            tokens[last] = tokens[last] with { Text = tokens[last].Text + ";" };
+        }
+        return string.Concat(tokens.Select(item => item.Text)).TrimEnd();
+    }
+
+    private static string EnsurePostgreSqlInsertInto(string body)
+    {
+        var tokens = TSqlTokenizer.Tokenize(body).ToList();
+        for (var index = 0; index < tokens.Count; index++)
+        {
+            if (tokens[index].Kind != TSqlTokenKind.Word ||
+                !tokens[index].Text.Equals("INSERT", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            var target = NextSignificantIndex(tokens, index);
+            if (target >= 0 &&
+                !tokens[target].Text.Equals("INTO", StringComparison.OrdinalIgnoreCase) &&
+                IsIdentifier(tokens[target]))
+            {
+                tokens[index] = tokens[index] with { Text = tokens[index].Text + " INTO" };
+            }
+        }
+        return string.Concat(tokens.Select(item => item.Text));
+    }
+
+    private static bool HasUpdateTargetingCte(string body)
+    {
+        var tokens = TSqlTokenizer.Tokenize(body).ToList();
+        for (var withIndex = 0; withIndex < tokens.Count; withIndex++)
+        {
+            if (tokens[withIndex].Kind != TSqlTokenKind.Word ||
+                !tokens[withIndex].Text.Equals("WITH", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var cteNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var nameIndex = NextSignificant(tokens, withIndex);
+            if (nameIndex >= 0 && tokens[nameIndex].Text.Equals("RECURSIVE", StringComparison.OrdinalIgnoreCase))
+            {
+                nameIndex = NextSignificant(tokens, nameIndex);
+            }
+
+            while (nameIndex >= 0 && IsIdentifier(tokens[nameIndex]))
+            {
+                cteNames.Add(NormalizeIdentifier(tokens[nameIndex].Text));
+                var asIndex = nameIndex;
+                var depth = 0;
+                while ((asIndex = NextSignificant(tokens, asIndex)) >= 0)
+                {
+                    if (tokens[asIndex].Text == "(")
+                    {
+                        depth++;
+                    }
+                    else if (tokens[asIndex].Text == ")")
+                    {
+                        depth--;
+                    }
+                    else if (depth == 0 &&
+                             tokens[asIndex].Kind == TSqlTokenKind.Word &&
+                             tokens[asIndex].Text.Equals("AS", StringComparison.OrdinalIgnoreCase))
+                    {
+                        break;
+                    }
+                }
+                if (asIndex < 0)
+                {
+                    break;
+                }
+
+                var openIndex = NextSignificant(tokens, asIndex);
+                if (openIndex < 0 || tokens[openIndex].Text != "(")
+                {
+                    break;
+                }
+                var closeIndex = MatchingCloseParenthesis(tokens, openIndex);
+                if (closeIndex < 0)
+                {
+                    break;
+                }
+
+                var nextIndex = NextSignificant(tokens, closeIndex);
+                if (nextIndex >= 0 && tokens[nextIndex].Text == ",")
+                {
+                    nameIndex = NextSignificant(tokens, nextIndex);
+                    continue;
+                }
+                if (nextIndex >= 0 &&
+                    tokens[nextIndex].Kind == TSqlTokenKind.Word &&
+                    tokens[nextIndex].Text.Equals("UPDATE", StringComparison.OrdinalIgnoreCase))
+                {
+                    var targetIndex = NextSignificant(tokens, nextIndex);
+                    return targetIndex >= 0 &&
+                           IsIdentifier(tokens[targetIndex]) &&
+                           cteNames.Contains(NormalizeIdentifier(tokens[targetIndex].Text));
+                }
+                break;
+            }
+        }
+        return false;
+    }
+
+    private static string NormalizeIdentifier(string identifier) =>
+        identifier.Trim().Trim('[', ']', '"').ToLowerInvariant();
+
+    private static string TerminateAdjacentProcedureDmlStatements(string body)
+    {
+        var tokens = TSqlTokenizer.Tokenize(body).ToList();
+        string? statementKind = null;
+        var insertHasValues = false;
+        var depth = 0;
+        for (var index = 0; index < tokens.Count; index++)
+        {
+            var token = tokens[index];
+            if (token.Kind is TSqlTokenKind.String or TSqlTokenKind.Comment)
+            {
+                continue;
+            }
+            if (token.Text == "(")
+            {
+                depth++;
+                continue;
+            }
+            if (token.Text == ")")
+            {
+                depth--;
+                continue;
+            }
+            if (depth != 0)
+            {
+                continue;
+            }
+            if (token.Text == ";")
+            {
+                statementKind = null;
+                insertHasValues = false;
+                continue;
+            }
+            if (statementKind == "INSERT" && token.Kind == TSqlTokenKind.Word &&
+                token.Text.Equals("VALUES", StringComparison.OrdinalIgnoreCase))
+            {
+                insertHasValues = true;
+                continue;
+            }
+            if (!IsDmlStatementKeyword(token))
+            {
+                continue;
+            }
+            var currentKind = token.Text.ToUpperInvariant();
+            if (statementKind is null)
+            {
+                statementKind = currentKind;
+                continue;
+            }
+            if (!StartsOnNewLine(tokens, index) ||
+                statementKind == "INSERT" && currentKind == "SELECT" && !insertHasValues)
+            {
+                continue;
+            }
+            var previous = PreviousSignificant(tokens, index);
+            if (previous >= 0 && tokens[previous].Text != ";")
+            {
+                tokens[previous] = tokens[previous] with { Text = tokens[previous].Text + ";" };
+            }
+            statementKind = currentKind;
+            insertHasValues = false;
+        }
+        return string.Concat(tokens.Select(item => item.Text));
+    }
+
+    private static bool IsDmlStatementKeyword(TSqlToken token) =>
+        token.Kind == TSqlTokenKind.Word &&
+        token.Text.ToUpperInvariant() is "INSERT" or "UPDATE" or "DELETE" or "SELECT";
+
+    private static bool StartsOnNewLine(List<TSqlToken> tokens, int index)
+    {
+        for (var cursor = index - 1; cursor >= 0; cursor--)
+        {
+            if (tokens[cursor].Kind == TSqlTokenKind.Whitespace)
+            {
+                if (tokens[cursor].Text.IndexOfAny(['\r', '\n']) >= 0)
+                {
+                    return true;
+                }
+                continue;
+            }
+            if (tokens[cursor].Kind == TSqlTokenKind.Comment)
+            {
+                continue;
+            }
+            return false;
+        }
+        return false;
+    }
+
+    private static string RemoveRedundantProcedureBlocks(string body) =>
+        Regex.Replace(
+            body,
+            @"(?im)^\s*(?:BEGIN|END)\s*;?\s*$",
+            string.Empty,
+            RegexOptions.CultureInvariant);
+
+    private static ConversionResult<string> ConvertResultSetProcedure(
+        InventoryObject source,
+        ModuleInventory module,
+        ConversionContext context,
+        string body)
+    {
+        if (module.ResultColumns.Count == 0 ||
+            module.Parameters.Any(item => item.ParameterId != 0 && item.IsOutput))
+        {
+            return ManualSkeleton(
+                source,
+                context,
+                module,
+                "Stored procedure result shape is not deterministic; a refcursor compatibility contract is required.",
+                "dynamic or multiple result-set interface");
+        }
+        var stripped = RemoveSqlServerSessionStatements(StripBeginEnd(body)).Trim();
+        var transformed = TransformBody(stripped, source, module, context, out var unsupported);
+        if (unsupported.Count > 0 || !transformed.TrimStart().StartsWith("SELECT", StringComparison.OrdinalIgnoreCase))
+        {
+            return ManualSkeleton(
+                source, context, module, "Result-set procedure contains non-query statements.", unsupported.ToArray());
+        }
+        var columns = module.ResultColumns.OrderBy(item => item.OrdinalPosition).Select(column =>
+        {
+            var type = context.TypeMappings.Map(
+                column.SystemTypeName,
+                column.MaximumLength,
+                column.Precision,
+                column.Scale,
+                context.Options).TargetType;
+            var name = context.Identifiers.MapChildIdentifier(
+                source.Id, "result_column", source.SourceSchema, column.Name);
+            return $"{name} {type}";
+        });
+        var sql = $"CREATE OR REPLACE FUNCTION {context.Identifiers.MapObject(source).QualifiedName}" +
+                  $"({BuildParameters(module, context)}) RETURNS TABLE ({string.Join(", ", columns)}){Environment.NewLine}" +
+                  $"LANGUAGE sql{Environment.NewLine}AS $migrationstudio${Environment.NewLine}" +
+                  $"    {RewriteVariables(transformed.Trim().TrimEnd(';'), module, [])};{Environment.NewLine}" +
+                  "$migrationstudio$;";
+        return ConversionRuleSupport.Success(
+            sql,
+            "PROCEDURE.RESULT_SET.TABLE_FUNCTION",
+            classification: ConversionClassification.AutomaticWithWarning,
+            confidence: 0.75m);
+    }
+
+    private static ConversionResult<string> ConvertMultiStatementTableFunction(
+        InventoryObject source,
+        ModuleInventory module,
+        ConversionContext context)
+    {
+        var body = ExtractAfterAs(source.SourceDefinition!);
+        var returnVariable = Regex.Match(
+            source.SourceDefinition!,
+            @"\bRETURNS\s+@(?<name>\w+)\s+TABLE\b",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant).Groups["name"].Value;
+        if (body is null || returnVariable.Length == 0 || module.ResultColumns.Count == 0 ||
+            ContainsAny(body, "BEGIN TRY", "BEGIN CATCH", "CURSOR", "EXEC", "#", "WHILE "))
+        {
+            return ManualSkeleton(
+                source, context, module, "Multi-statement TVF return-table shape or body is not safely inferable.", "multi-statement TVF");
+        }
+        var stripped = StripBeginEnd(body);
+        stripped = Regex.Replace(
+            stripped,
+            $@"\bINSERT\s+INTO\s+@{Regex.Escape(returnVariable)}\b",
+            "RETURN QUERY",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        stripped = Regex.Replace(
+            stripped,
+            $@"(?im)^\s*RETURN(?:\s+@{Regex.Escape(returnVariable)})?\s*;?\s*$",
+            string.Empty,
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (!stripped.Contains("RETURN QUERY", StringComparison.OrdinalIgnoreCase))
+        {
+            return ManualSkeleton(
+                source, context, module, "Multi-statement TVF does not populate its return table with a supported INSERT.", "return-table mutation");
+        }
+        var transformed = TransformBody(stripped, source, module, context, out var unsupported);
+        if (unsupported.Count > 0)
+        {
+            return ManualSkeleton(source, context, module, "Multi-statement TVF query contains unsupported SQL.", unsupported.ToArray());
+        }
+        var columns = module.ResultColumns.OrderBy(item => item.OrdinalPosition).Select(column =>
+        {
+            var type = context.TypeMappings.Map(
+                column.SystemTypeName, column.MaximumLength, column.Precision, column.Scale, context.Options).TargetType;
+            return $"{context.Identifiers.MapChildIdentifier(source.Id, "result_column", source.SourceSchema, column.Name)} {type}";
+        });
+        var sql = $"CREATE OR REPLACE FUNCTION {context.Identifiers.MapObject(source).QualifiedName}" +
+                  $"({BuildParameters(module, context)}) RETURNS TABLE ({string.Join(", ", columns)}){Environment.NewLine}" +
+                  $"LANGUAGE plpgsql{Environment.NewLine}AS $migrationstudio${Environment.NewLine}" +
+                  $"BEGIN{Environment.NewLine}{Indent(RewriteVariables(transformed.Trim(), module, []), 4)}{Environment.NewLine}" +
+                  $"END;{Environment.NewLine}$migrationstudio$;";
+        return ConversionRuleSupport.Success(
+            sql,
+            "FUNCTION.MULTI_TVF.RETURN_QUERY",
+            classification: ConversionClassification.AutomaticWithWarning,
+            confidence: 0.7m);
+    }
+
+    private static bool TryExtractProcedureLocals(
+        string body,
+        InventoryObject source,
+        ModuleInventory module,
+        ConversionContext context,
+        out string bodyWithoutDeclarations,
+        out List<ProceduralLocal> declarations,
+        out Dictionary<string, string> localTypes,
+        out string error)
+    {
+        var extractedDeclarations = new List<ProceduralLocal>();
+        var extractedInitializers = new List<string?>();
+        var extractedLocalTypes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var localError = string.Empty;
+        var failed = false;
+        bodyWithoutDeclarations = Regex.Replace(
+            body,
+            @"(?im)^\s*DECLARE\s+(?<items>.+?)\s*;?\s*$",
+            match =>
+            {
+                foreach (var item in SplitTopLevel(match.Groups["items"].Value, ','))
+                {
+                    var declaration = Regex.Match(
+                        item,
+                        @"^\s*@(?<name>\w+)\s+(?<type>[\w.]+\s*(?:\(\s*(?:max|\d+)(?:\s*,\s*\d+)?\s*\))?)\s*(?:=\s*(?<value>[\s\S]+))?$",
+                        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+                    if (!declaration.Success ||
+                        !TryMapLocalType(declaration.Groups["type"].Value, context, out var targetType))
+                    {
+                        localError = $"Stored procedure has an unsupported local declaration: {item.Trim()}";
+                        failed = true;
+                        break;
+                    }
+                    var name = declaration.Groups["name"].Value;
+                    if (!extractedLocalTypes.TryAdd(name, targetType))
+                    {
+                        localError = $"Stored procedure declares local variable '@{name}' more than once.";
+                        failed = true;
+                        break;
+                    }
+                    extractedDeclarations.Add(new ProceduralLocal(
+                        name,
+                        $"v_{name.ToLowerInvariant()}",
+                        targetType,
+                        null));
+                    extractedInitializers.Add(
+                        declaration.Groups["value"].Success
+                            ? declaration.Groups["value"].Value.Trim()
+                            : null);
+                }
+                return string.Empty;
+            },
+            RegexOptions.CultureInvariant);
+        declarations = extractedDeclarations;
+        localTypes = extractedLocalTypes;
+        error = localError;
+        if (failed)
+        {
+            return false;
+        }
+
+        var locals = localTypes.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        for (var index = 0; index < declarations.Count; index++)
+        {
+            if (extractedInitializers[index] is { } initializer)
+            {
+                declarations[index] = declarations[index] with
+                {
+                    Initializer = TranslateProceduralExpression(
+                        initializer,
+                        source,
+                        module,
+                        context,
+                        locals,
+                        declarations[index].TargetType)
+                };
+            }
+        }
+        return true;
+    }
+
+    private static List<string> SplitTopLevel(string value, char separator)
+    {
+        var parts = new List<string>();
+        var start = 0;
+        var depth = 0;
+        for (var index = 0; index < value.Length; index++)
+        {
+            depth += value[index] switch { '(' => 1, ')' => -1, _ => 0 };
+            if (value[index] == separator && depth == 0)
+            {
+                parts.Add(value[start..index]);
+                start = index + 1;
+            }
+        }
+        parts.Add(value[start..]);
+        return parts;
+    }
+
+    private static string TranslateCompoundAssignments(
+        string body,
+        Dictionary<string, string> localTypes) =>
+        Regex.Replace(
+            body,
+            @"(?im)^\s*SET\s+@(?<name>\w+)\s*(?<operator>[+-])=\s*(?<expression>.+?)\s*;?\s*$",
+            match =>
+            {
+                var name = match.Groups["name"].Value;
+                if (!localTypes.TryGetValue(name, out var type))
+                {
+                    return match.Value;
+                }
+                var operation = match.Groups["operator"].Value == "+" && IsTextType(type)
+                    ? "||"
+                    : match.Groups["operator"].Value;
+                return $"v_{name.ToLowerInvariant()} := v_{name.ToLowerInvariant()} {operation} {match.Groups["expression"].Value.Trim().TrimEnd(';')};";
+            },
+            RegexOptions.CultureInvariant);
+
+    private static string TranslateSimpleAssignments(
+        string body,
+        IEnumerable<string> localNames)
+    {
+        var locals = localNames.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var tokens = TSqlTokenizer.Tokenize(body).ToList();
+        for (var index = 0; index < tokens.Count; index++)
+        {
+            if (tokens[index].Kind != TSqlTokenKind.Word ||
+                !tokens[index].Text.Equals("SET", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            var variable = NextSignificantIndex(tokens, index);
+            var equals = variable >= 0 ? NextSignificantIndex(tokens, variable) : -1;
+            var expressionStart = equals >= 0 ? NextSignificantIndex(tokens, equals) : -1;
+            if (variable < 0 || equals < 0 || expressionStart < 0 ||
+                tokens[variable].Kind != TSqlTokenKind.Word ||
+                !tokens[variable].Text.StartsWith('@') || tokens[equals].Text != "=")
+            {
+                continue;
+            }
+
+            var expressionEnd = tokens.Count - 1;
+            var terminator = -1;
+            var depth = 0;
+            for (var cursor = expressionStart; cursor < tokens.Count; cursor++)
+            {
+                if (tokens[cursor].Kind is not TSqlTokenKind.String and not TSqlTokenKind.Comment)
+                {
+                    depth += tokens[cursor].Text switch { "(" => 1, ")" => -1, _ => 0 };
+                    if (depth == 0 && tokens[cursor].Text == ";")
+                    {
+                        expressionEnd = cursor - 1;
+                        terminator = cursor;
+                        break;
+                    }
+                }
+                if (depth == 0 && tokens[cursor].Kind == TSqlTokenKind.Whitespace &&
+                    tokens[cursor].Text.IndexOfAny(['\r', '\n']) >= 0)
+                {
+                    var next = NextSignificantIndex(tokens, cursor);
+                    if (next >= 0 && IsProceduralStatementBoundary(tokens[next]))
+                    {
+                        expressionEnd = cursor - 1;
+                        break;
+                    }
+                }
+            }
+            if (expressionEnd < expressionStart)
+            {
+                continue;
+            }
+
+            var name = tokens[variable].Text[1..];
+            var prefix = locals.Contains(name) ? "v_" : "p_";
+            var expression = string.Concat(tokens
+                .Skip(expressionStart)
+                .Take(expressionEnd - expressionStart + 1)
+                .Select(item => item.Text)).Trim();
+            tokens[index] = tokens[index] with
+            {
+                Text = $"{prefix}{name.ToLowerInvariant()} := {expression};"
+            };
+            for (var clear = index + 1; clear <= expressionEnd; clear++)
+            {
+                tokens[clear] = tokens[clear] with { Text = string.Empty };
+            }
+            if (terminator >= 0)
+            {
+                tokens[terminator] = tokens[terminator] with { Text = string.Empty };
+            }
+        }
+        return string.Concat(tokens.Select(item => item.Text));
+    }
+
+    private static bool IsProceduralStatementBoundary(TSqlToken token) =>
+        token.Kind == TSqlTokenKind.Word &&
+        token.Text.ToUpperInvariant() is
+            "SET" or "SELECT" or "INSERT" or "UPDATE" or "DELETE" or "RAISE" or
+            "EXECUTE" or "IF" or "ELSE" or "END" or "RETURN" or "BEGIN";
+
+    private static bool IsTextType(string targetType) =>
+        targetType.Contains("text", StringComparison.OrdinalIgnoreCase) ||
+        targetType.Contains("character", StringComparison.OrdinalIgnoreCase) ||
+        targetType.Contains("varchar", StringComparison.OrdinalIgnoreCase);
+
+    private static string TranslatePrintStatements(
+        string body,
+        IReadOnlyDictionary<string, string> localTypes) =>
+        Regex.Replace(
+            body,
+            @"(?im)^\s*PRINT\s*(?:\(\s*(?<parenthesized>.+?)\s*\)|(?<bare>.+?))\s*;?\s*$",
+            match =>
+            {
+                var expression = match.Groups["parenthesized"].Success
+                    ? match.Groups["parenthesized"].Value
+                    : match.Groups["bare"].Value;
+                return $"RAISE NOTICE '%', " +
+                       $"{TranslateLocalTextConcatenation(expression.Trim().TrimEnd(';'), localTypes)};";
+            },
+            RegexOptions.CultureInvariant);
+
+    private static bool TryTranslateDynamicExecute(
+        string body,
+        IReadOnlyDictionary<string, string> localTypes,
+        out string translated)
+    {
+        translated = body;
+        var tokens = TSqlTokenizer.Tokenize(body).ToList();
+        for (var index = 0; index < tokens.Count; index++)
+        {
+            if (tokens[index].Kind != TSqlTokenKind.Word ||
+                !tokens[index].Text.Equals("EXEC", StringComparison.OrdinalIgnoreCase) &&
+                !tokens[index].Text.Equals("EXECUTE", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            var next = NextSignificantIndex(tokens, index);
+            if (next < 0)
+            {
+                return false;
+            }
+            var expressionStart = next;
+            var expressionEnd = next + 1;
+            var clearThrough = next;
+            if (tokens[next].Text == "(")
+            {
+                var close = MatchingCloseParenthesis(tokens, next);
+                if (close < 0)
+                {
+                    return false;
+                }
+                expressionStart = next + 1;
+                expressionEnd = close;
+                clearThrough = close;
+            }
+            if (!TryRenderDynamicLocalExpression(
+                    tokens,
+                    expressionStart,
+                    expressionEnd,
+                    localTypes,
+                    out var expression))
+            {
+                return false;
+            }
+            var terminator = NextSignificantIndex(tokens, clearThrough);
+            if (terminator >= 0 && tokens[terminator].Text == ";")
+            {
+                clearThrough = terminator;
+            }
+            tokens[index] = tokens[index] with { Text = $"EXECUTE {expression};" };
+            for (var clear = index + 1; clear <= clearThrough; clear++)
+            {
+                tokens[clear] = tokens[clear] with { Text = string.Empty };
+            }
+        }
+        translated = string.Concat(tokens.Select(item => item.Text));
+        return true;
+    }
+
+    private static bool TryRenderDynamicLocalExpression(
+        List<TSqlToken> tokens,
+        int start,
+        int end,
+        IReadOnlyDictionary<string, string> localTypes,
+        out string expression)
+    {
+        expression = string.Empty;
+        var output = new StringBuilder();
+        var expectVariable = true;
+        for (var index = start; index < end; index++)
+        {
+            var token = tokens[index];
+            if (token.Kind is TSqlTokenKind.Whitespace or TSqlTokenKind.Comment)
+            {
+                continue;
+            }
+            if (expectVariable)
+            {
+                if (token.Kind != TSqlTokenKind.Word || !token.Text.StartsWith('@') ||
+                    !localTypes.TryGetValue(token.Text[1..], out var targetType) ||
+                    !IsTextType(targetType))
+                {
+                    return false;
+                }
+                output.Append("v_").Append(token.Text[1..].ToLowerInvariant());
+                expectVariable = false;
+                continue;
+            }
+            if (token.Text != "+")
+            {
+                return false;
+            }
+            output.Append(" || ");
+            expectVariable = true;
+        }
+        if (expectVariable || output.Length == 0)
+        {
+            return false;
+        }
+        expression = output.ToString();
+        return true;
+    }
+
+    private static string TranslateLocalTextConcatenation(
+        string expression,
+        IReadOnlyDictionary<string, string> localTypes)
+    {
+        var tokens = TSqlTokenizer.Tokenize(expression).ToList();
+        for (var index = 0; index < tokens.Count; index++)
+        {
+            if (tokens[index].Text != "+")
+            {
+                continue;
+            }
+            var previous = PreviousSignificant(tokens, index);
+            var next = NextSignificantIndex(tokens, index);
+            if (IsTextLocal(tokens, previous, localTypes) && IsTextLocal(tokens, next, localTypes))
+            {
+                tokens[index] = tokens[index] with { Text = "||" };
+            }
+        }
+        return string.Concat(tokens.Select(item => item.Text));
+    }
+
+    private static bool IsTextLocal(
+        List<TSqlToken> tokens,
+        int index,
+        IReadOnlyDictionary<string, string> localTypes)
+    {
+        if (index < 0 || index >= tokens.Count || tokens[index].Kind != TSqlTokenKind.Word ||
+            !tokens[index].Text.StartsWith('@'))
+        {
+            return false;
+        }
+        return localTypes.TryGetValue(tokens[index].Text[1..], out var type) && IsTextType(type);
+    }
+
+    private static bool HasSqlServerMetadataMultiAssignment(string body)
+    {
+        if (!ContainsWord(body, "OBJECT_ID"))
+        {
+            return false;
+        }
+        var tokens = TSqlTokenizer.Tokenize(body);
+        for (var index = 0; index < tokens.Count; index++)
+        {
+            if (tokens[index].Kind != TSqlTokenKind.Word ||
+                !tokens[index].Text.Equals("SELECT", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            var assignments = 0;
+            var depth = 0;
+            for (var cursor = index + 1; cursor < tokens.Count; cursor++)
+            {
+                if (tokens[cursor].Kind is TSqlTokenKind.String or TSqlTokenKind.Comment)
+                {
+                    continue;
+                }
+                depth += tokens[cursor].Text switch { "(" => 1, ")" => -1, _ => 0 };
+                if (depth == 0 && tokens[cursor].Kind == TSqlTokenKind.Word &&
+                    tokens[cursor].Text.StartsWith('@'))
+                {
+                    var equals = NextSignificantIndex(tokens, cursor);
+                    if (equals >= 0 && tokens[equals].Text == "=")
+                    {
+                        assignments++;
+                    }
+                }
+                if (depth == 0 && tokens[cursor].Kind == TSqlTokenKind.Word &&
+                    tokens[cursor].Text.ToUpperInvariant() is "IF" or "RETURN")
+                {
+                    break;
+                }
+            }
+            if (assignments > 1)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
 
     private static ConversionResult<string> ConvertTrigger(
         InventoryObject source,
@@ -417,7 +1245,7 @@ public sealed partial class ProgrammableObjectConverter(
             InventoryObjectType.StoredProcedure =>
                 $"CREATE OR REPLACE PROCEDURE {target.QualifiedName}({BuildParameters(module, context)}) LANGUAGE plpgsql AS $migrationstudio${Environment.NewLine}BEGIN{Environment.NewLine}    RAISE EXCEPTION 'Manual conversion required for {ConversionRuleSupport.EscapeLiteral(source.QualifiedSourceName)}';{Environment.NewLine}END;{Environment.NewLine}$migrationstudio$;{Environment.NewLine}/* Source T-SQL:{Environment.NewLine}{sourceComment}{Environment.NewLine}*/",
             InventoryObjectType.Function =>
-                $"CREATE OR REPLACE FUNCTION {target.QualifiedName}({BuildParameters(module, context)}) RETURNS void LANGUAGE plpgsql AS $migrationstudio${Environment.NewLine}BEGIN{Environment.NewLine}    RAISE EXCEPTION 'Manual conversion required for {ConversionRuleSupport.EscapeLiteral(source.QualifiedSourceName)}';{Environment.NewLine}END;{Environment.NewLine}$migrationstudio$;{Environment.NewLine}/* Source T-SQL:{Environment.NewLine}{sourceComment}{Environment.NewLine}*/",
+                $"CREATE OR REPLACE FUNCTION {target.QualifiedName}({BuildParameters(module, context)}) RETURNS {MapReturnType(module!, context) ?? "void"} LANGUAGE plpgsql AS $migrationstudio${Environment.NewLine}BEGIN{Environment.NewLine}    RAISE EXCEPTION 'Manual conversion required for {ConversionRuleSupport.EscapeLiteral(source.QualifiedSourceName)}';{Environment.NewLine}END;{Environment.NewLine}$migrationstudio$;{Environment.NewLine}/* Source T-SQL:{Environment.NewLine}{sourceComment}{Environment.NewLine}*/",
             _ => $"-- Manual trigger conversion required for {target.QualifiedName}.{Environment.NewLine}/* Source T-SQL:{Environment.NewLine}{sourceComment}{Environment.NewLine}*/"
         };
         return ConversionRuleSupport.Manual(source, reason, skeleton, unsupported);
@@ -550,12 +1378,20 @@ public sealed partial class ProgrammableObjectConverter(
     }
 
     private static ConversionResult<string> ConvertProceduralScalarFunction(
-        InventoryObject source,
-        ModuleInventory module,
-        ConversionContext context,
-        string body)
+    InventoryObject source,
+    ModuleInventory module,
+    ConversionContext context,
+    string body)
     {
-        if (ContainsAny(body, "BEGIN TRY", "BEGIN CATCH", "CURSOR", "EXEC(", "SP_EXECUTESQL", "#", "WHILE "))
+        if (ContainsAny(
+                body,
+                "BEGIN TRY",
+                "BEGIN CATCH",
+                "CURSOR",
+                "EXEC(",
+                "SP_EXECUTESQL",
+                "#",
+                "WHILE "))
         {
             return ManualSkeleton(
                 source,
@@ -565,7 +1401,12 @@ public sealed partial class ProgrammableObjectConverter(
                 "unsupported procedural scalar construct");
         }
 
-        if (TryConvertGuardReturnBody(body, source, module, context, out var guardSql))
+        if (TryConvertGuardReturnBody(
+                body,
+                source,
+                module,
+                context,
+                out var guardSql))
         {
             return ConversionRuleSupport.Success(
                 guardSql,
@@ -574,13 +1415,62 @@ public sealed partial class ProgrammableObjectConverter(
                 confidence: 0.8m);
         }
 
-        if (TryConvertSimpleIfReturnBody(body, source, module, context, out var simpleIfSql))
+        if (TryConvertSimpleIfReturnBody(
+                body,
+                source,
+                module,
+                context,
+                out var simpleIfSql))
         {
             return ConversionRuleSupport.Success(
                 simpleIfSql,
                 "FUNCTION.SCALAR.PLPGSQL.IF",
                 classification: ConversionClassification.AutomaticWithWarning,
                 confidence: 0.8m);
+        }
+
+        if (HasSqlServerMetadataMultiAssignment(body))
+        {
+            return ManualSkeleton(
+                source,
+                context,
+                module,
+                "SQL Server metadata-function multi-assignment cannot be mapped to PostgreSQL with proven semantics.",
+                "metadata multi-target SELECT assignment");
+        }
+
+        /*
+         * IMPORTANT:
+         * Functions containing IF/ELSE must only be accepted through the
+         * structured control-flow converter.
+         *
+         * The generic procedural parser understands DECLARE, SET, SELECT
+         * assignment and RETURN, but it does not understand IF/ELSE blocks.
+         * Allowing it to process such a body can merge the IF condition and
+         * following block into the preceding SET expression.
+         */
+        if (ContainsWord(body, "IF"))
+        {
+            if (TryConvertStructuredAssignmentIfBody(
+                    body,
+                    source,
+                    module,
+                    context,
+                    out var structuredIfSql))
+            {
+                return ConversionRuleSupport.Success(
+                    structuredIfSql,
+                    "FUNCTION.SCALAR.PLPGSQL.IF_ASSIGNMENT",
+                    classification: ConversionClassification.AutomaticWithWarning,
+                    confidence: 0.75m);
+            }
+
+            return ManualSkeleton(
+                source,
+                context,
+                module,
+                "Procedural scalar function contains IF/ELSE control flow that could not be parsed safely.",
+                "unparsed scalar IF/ELSE control flow");
         }
 
         if (!TryParseProceduralScalarBody(
@@ -615,19 +1505,29 @@ public sealed partial class ProgrammableObjectConverter(
             Environment.NewLine,
             declarations.Select(item =>
                 $"    {item.TargetName} {item.TargetType}" +
-                (item.Initializer is null ? ";" : $" := {item.Initializer};")));
+                (item.Initializer is null
+                    ? ";"
+                    : $" := {item.Initializer};")));
+
         var statementSql = string.Join(
             Environment.NewLine,
-            statements.Select(item => $"    {item.Trim().TrimEnd(';')};"));
+            statements.Select(item =>
+                $"    {item.Trim().TrimEnd(';')};"));
+
         var sql =
             $"CREATE OR REPLACE FUNCTION {context.Identifiers.MapObject(source).QualifiedName}" +
             $"({BuildParameters(module, context)}) RETURNS {returnType}{Environment.NewLine}" +
-            $"LANGUAGE plpgsql{Environment.NewLine}AS $migrationstudio${Environment.NewLine}" +
+            $"LANGUAGE plpgsql{Environment.NewLine}" +
+            $"AS $migrationstudio${Environment.NewLine}" +
             (declarations.Count == 0
                 ? string.Empty
-                : $"DECLARE{Environment.NewLine}{declarationSql}{Environment.NewLine}") +
-            $"BEGIN{Environment.NewLine}{statementSql}{Environment.NewLine}" +
-            $"END;{Environment.NewLine}$migrationstudio$;";
+                : $"DECLARE{Environment.NewLine}" +
+                  $"{declarationSql}{Environment.NewLine}") +
+            $"BEGIN{Environment.NewLine}" +
+            $"{statementSql}{Environment.NewLine}" +
+            $"END;{Environment.NewLine}" +
+            "$migrationstudio$;";
+
         return ConversionRuleSupport.Success(
             sql,
             "FUNCTION.SCALAR.PLPGSQL",
@@ -797,6 +1697,536 @@ public sealed partial class ProgrammableObjectConverter(
         return true;
     }
 
+    private static bool TryConvertStructuredAssignmentIfBody(
+        string body,
+        InventoryObject source,
+        ModuleInventory module,
+        ConversionContext context,
+        out string sql)
+    {
+        sql = string.Empty;
+        if (!ContainsWord(body, "IF"))
+        {
+            return false;
+        }
+
+        var normalizedBody = string.Join(
+            Environment.NewLine,
+            SplitStructuredScalarLines(body.Trim().TrimEnd(';')));
+        var proceduralBody = StripBeginEnd(normalizedBody);
+        if (!TryExtractProcedureLocals(
+                proceduralBody,
+                source,
+                module,
+                context,
+                out proceduralBody,
+                out var declarations,
+                out var localTypes,
+                out _))
+        {
+            return false;
+        }
+
+        var lines = SplitStructuredScalarLines(proceduralBody);
+        var index = 0;
+        if (!TryParseStructuredScalarStatements(
+                lines,
+                ref index,
+                stopAtEnd: false,
+                source,
+                module,
+                context,
+                localTypes,
+                out var statements) || index != lines.Count ||
+            !statements.Any(item => item.TrimStart().StartsWith("RETURN ", StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        var returnType = MapReturnType(module, context);
+        if (returnType is null)
+        {
+            return false;
+        }
+        var declarationSql = declarations.Count == 0
+            ? string.Empty
+            : $"DECLARE{Environment.NewLine}" +
+              string.Join(Environment.NewLine, declarations.Select(item =>
+                  $"    {item.TargetName} {item.TargetType}" +
+                  (item.Initializer is null ? ";" : $" := {item.Initializer};"))) +
+              Environment.NewLine;
+        sql =
+            $"CREATE OR REPLACE FUNCTION {context.Identifiers.MapObject(source).QualifiedName}" +
+            $"({BuildParameters(module, context)}) RETURNS {returnType}{Environment.NewLine}" +
+            $"LANGUAGE plpgsql{Environment.NewLine}AS $migrationstudio${Environment.NewLine}" +
+            declarationSql +
+            $"BEGIN{Environment.NewLine}" +
+            string.Join(Environment.NewLine, statements.Select(item => $"    {item}")) + Environment.NewLine +
+            $"END;{Environment.NewLine}$migrationstudio$;";
+        return true;
+    }
+
+    private static List<string> SplitStructuredScalarLines(string body)
+    {
+        var tokens = TSqlTokenizer.Tokenize(body).ToList();
+        var normalized = new StringBuilder(body.Length + 64);
+        var caseDepth = 0;
+
+        for (var index = 0; index < tokens.Count; index++)
+        {
+            var token = tokens[index];
+            var isWord = token.Kind == TSqlTokenKind.Word;
+
+            if (isWord &&
+                token.Text.Equals("CASE", StringComparison.OrdinalIgnoreCase))
+            {
+                caseDepth++;
+            }
+            else if (isWord &&
+                     token.Text.Equals("END", StringComparison.OrdinalIgnoreCase) &&
+                     caseDepth > 0)
+            {
+                caseDepth--;
+            }
+
+            if (caseDepth == 0 &&
+                isWord &&
+                IsStructuredScalarKeyword(token.Text) &&
+                CurrentLogicalLineHasContent(normalized))
+            {
+                var previous = PreviousSignificant(tokens, index);
+
+                var isIfFollowingElse =
+                    token.Text.Equals("IF", StringComparison.OrdinalIgnoreCase) &&
+                    previous >= 0 &&
+                    tokens[previous].Kind == TSqlTokenKind.Word &&
+                    tokens[previous].Text.Equals(
+                        "ELSE",
+                        StringComparison.OrdinalIgnoreCase);
+
+                if (!isIfFollowingElse)
+                {
+                    normalized.AppendLine();
+                }
+            }
+
+            normalized.Append(token.Text);
+        }
+
+        return normalized
+            .ToString()
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace('\r', '\n')
+            .Split('\n')
+            .Select(item => item.Trim())
+            .Where(item =>
+                item.Length > 0 &&
+                !item.StartsWith("--", StringComparison.Ordinal))
+            .ToList();
+    }
+    private static bool IsStructuredScalarKeyword(string value) =>
+        value.ToUpperInvariant() is "BEGIN" or "END" or "IF" or "ELSE" or
+            "DECLARE" or "SET" or "SELECT" or "RETURN";
+
+    private static bool CurrentLogicalLineHasContent(StringBuilder value)
+    {
+        for (var index = value.Length - 1; index >= 0; index--)
+        {
+            if (value[index] is '\r' or '\n')
+            {
+                return false;
+            }
+            if (!char.IsWhiteSpace(value[index]))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static bool TryParseStructuredScalarStatements(
+        IReadOnlyList<string> lines,
+        ref int index,
+        bool stopAtEnd,
+        InventoryObject source,
+        ModuleInventory module,
+        ConversionContext context,
+        Dictionary<string, string> localTypes,
+        out List<string> statements)
+    {
+        statements = [];
+        var localNames = localTypes.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        while (index < lines.Count)
+        {
+            var line = lines[index].Trim().TrimEnd(';').TrimEnd();
+            if (line.Equals("END", StringComparison.OrdinalIgnoreCase))
+            {
+                return stopAtEnd;
+            }
+            if (line.Equals("ELSE", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+            if (line.Equals("BEGIN", StringComparison.OrdinalIgnoreCase))
+            {
+                index++;
+                if (!TryParseStructuredScalarStatements(
+                        lines, ref index, true, source, module, context, localTypes, out var grouped) ||
+                    index >= lines.Count)
+                {
+                    return false;
+                }
+                index++;
+                statements.AddRange(grouped);
+                continue;
+            }
+            if (Regex.IsMatch(line, @"^IF\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+            {
+                var conditionText = Regex.Replace(
+                    line,
+                    @"^IF\s*",
+                    string.Empty,
+                    RegexOptions.IgnoreCase | RegexOptions.CultureInvariant).Trim();
+                conditionText = TrimBalancedOuterParentheses(conditionText);
+                conditionText = NormalizeBooleanLocalComparisons(conditionText, localTypes);
+                var condition = TranslateProceduralExpression(
+                    conditionText, source, module, context, localNames, "boolean");
+                if (string.IsNullOrWhiteSpace(condition))
+                {
+                    return false;
+                }
+                index++;
+                if (!TryParseStructuredScalarBranch(
+                        lines, ref index, source, module, context, localTypes, out var whenTrue))
+                {
+                    return false;
+                }
+
+
+                List<string>? whenFalse = null;
+                List<string>? elseIfStatements = null;
+
+                if (index < lines.Count)
+                {
+                    var nextLine = lines[index]
+                        .Trim()
+                        .TrimEnd(';')
+                        .Trim();
+
+                    if (nextLine.StartsWith(
+                            "ELSE IF ",
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        var nestedIf = nextLine[5..].Trim();
+
+                        var nestedLines = new List<string>
+        {
+            nestedIf
+        };
+
+                        index++;
+
+                        while (index < lines.Count)
+                        {
+                            var candidate = lines[index]
+                                .Trim()
+                                .TrimEnd(';')
+                                .Trim();
+
+                            if (candidate.Equals(
+                                    "END",
+                                    StringComparison.OrdinalIgnoreCase) ||
+                                candidate.Equals(
+                                    "ELSE",
+                                    StringComparison.OrdinalIgnoreCase) ||
+                                candidate.StartsWith(
+                                    "ELSE IF ",
+                                    StringComparison.OrdinalIgnoreCase))
+                            {
+                                break;
+                            }
+
+                            nestedLines.Add(lines[index]);
+                            index++;
+                        }
+
+                        var nestedIndex = 0;
+
+                        if (!TryParseStructuredScalarStatements(
+                                nestedLines,
+                                ref nestedIndex,
+                                stopAtEnd: false,
+                                source,
+                                module,
+                                context,
+                                localTypes,
+                                out elseIfStatements) ||
+                            nestedIndex != nestedLines.Count)
+                        {
+                            return false;
+                        }
+                    }
+                    else if (nextLine.Equals(
+                                 "ELSE",
+                                 StringComparison.OrdinalIgnoreCase))
+                    {
+                        index++;
+
+                        if (!TryParseStructuredScalarBranch(
+                                lines,
+                                ref index,
+                                source,
+                                module,
+                                context,
+                                localTypes,
+                                out var parsedFalse))
+                        {
+                            return false;
+                        }
+
+                        whenFalse = parsedFalse;
+                    }
+                }
+
+                statements.Add($"IF {condition} THEN");
+                statements.AddRange(
+                    whenTrue.Select(item => $"    {item}"));
+
+                if (elseIfStatements is not null)
+                {
+                    /*
+                     * The nested parser produces a complete IF ... END IF block.
+                     * Emit it inside ELSE. PostgreSQL accepts this form and it preserves
+                     * the source ELSE IF semantics.
+                     */
+                    statements.Add("ELSE");
+                    statements.AddRange(
+                        elseIfStatements.Select(item => $"    {item}"));
+                }
+                else if (whenFalse is not null)
+                {
+                    statements.Add("ELSE");
+                    statements.AddRange(
+                        whenFalse.Select(item => $"    {item}"));
+                }
+
+                statements.Add("END IF;");
+
+                statements.Add($"IF {condition} THEN");
+                statements.AddRange(whenTrue.Select(item => $"    {item}"));
+                if (whenFalse is not null)
+                {
+                    statements.Add("ELSE");
+                    statements.AddRange(whenFalse.Select(item => $"    {item}"));
+                }
+                statements.Add("END IF;");
+                continue;
+            }
+            if (Regex.IsMatch(line, @"^SET\s+@", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+            {
+                var assignment = Regex.Match(
+                    line,
+                    @"^SET\s+@(?<name>\w+)\s*=\s*(?<expression>[\s\S]+)$",
+                    RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+                if (!assignment.Success ||
+                    !localTypes.TryGetValue(assignment.Groups["name"].Value, out var targetType))
+                {
+                    return false;
+                }
+                var expression = TranslateProceduralExpression(
+                    assignment.Groups["expression"].Value,
+                    source,
+                    module,
+                    context,
+                    localNames,
+                    targetType);
+                statements.Add($"v_{assignment.Groups["name"].Value.ToLowerInvariant()} := {expression};");
+                index++;
+                continue;
+            }
+            if (Regex.IsMatch(line, @"^SELECT\s+@", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+            {
+                var selectLines = new List<string> { line };
+                index++;
+                while (index < lines.Count && !IsStructuredScalarControlLine(lines[index]))
+                {
+                    selectLines.Add(lines[index]);
+                    index++;
+                }
+                if (!TryTranslateStructuredSelectAssignment(
+                        string.Join(Environment.NewLine, selectLines),
+                        source,
+                        module,
+                        context,
+                        localTypes,
+                        out var selectSql))
+                {
+                    return false;
+                }
+                statements.Add(selectSql);
+                continue;
+            }
+            if (Regex.IsMatch(line, @"^RETURN\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+            {
+                var expressionText = Regex.Replace(
+                    line,
+                    @"^RETURN\s+",
+                    string.Empty,
+                    RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+                var expression = TranslateProceduralExpression(
+                    expressionText, source, module, context, localNames, MapReturnType(module, context));
+                statements.Add($"RETURN {expression};");
+                index++;
+                continue;
+            }
+            return false;
+        }
+        return !stopAtEnd;
+    }
+
+    private static bool TryParseStructuredScalarBranch(
+        IReadOnlyList<string> lines,
+        ref int index,
+        InventoryObject source,
+        ModuleInventory module,
+        ConversionContext context,
+        Dictionary<string, string> localTypes,
+        out List<string> statements)
+    {
+        statements = [];
+        if (index >= lines.Count)
+        {
+            return false;
+        }
+        if (lines[index].Trim().TrimEnd(';').Equals("BEGIN", StringComparison.OrdinalIgnoreCase))
+        {
+            index++;
+            if (!TryParseStructuredScalarStatements(
+                    lines, ref index, true, source, module, context, localTypes, out statements) ||
+                index >= lines.Count)
+            {
+                return false;
+            }
+            index++;
+            return true;
+        }
+
+        return TryParseSingleStructuredScalarStatement(
+            lines, ref index, source, module, context, localTypes, out statements);
+    }
+
+    private static bool TryParseSingleStructuredScalarStatement(
+        IReadOnlyList<string> lines,
+        ref int index,
+        InventoryObject source,
+        ModuleInventory module,
+        ConversionContext context,
+        Dictionary<string, string> localTypes,
+        out List<string> statements)
+    {
+        var boundary = index + 1;
+        while (boundary < lines.Count && !IsStructuredScalarControlLine(lines[boundary]))
+        {
+            boundary++;
+        }
+        var slice = lines.Skip(index).Take(boundary - index).ToList();
+        var localIndex = 0;
+        if (!TryParseStructuredScalarStatements(
+                slice, ref localIndex, false, source, module, context, localTypes, out statements) ||
+            localIndex != slice.Count || statements.Count != 1)
+        {
+            return false;
+        }
+        index = boundary;
+        return true;
+    }
+
+    private static bool IsStructuredScalarControlLine(string value)
+    {
+        var line = value.Trim().TrimEnd(';').TrimStart();
+        return Regex.IsMatch(
+            line,
+            @"^(?:IF|ELSE|BEGIN|END|SET\s+@|SELECT\s+@|RETURN\b)",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    }
+
+    private static bool TryTranslateStructuredSelectAssignment(
+        string statement,
+        InventoryObject source,
+        ModuleInventory module,
+        ConversionContext context,
+        Dictionary<string, string> localTypes,
+        out string sql)
+    {
+        sql = string.Empty;
+        var match = Regex.Match(
+            statement,
+            @"^\s*SELECT\s+@(?<name>\w+)\s*=\s*(?<body>[\s\S]+)$",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (!match.Success || !localTypes.TryGetValue(match.Groups["name"].Value, out var targetType))
+        {
+            return false;
+        }
+        var tokens = TSqlTokenizer.Tokenize(match.Groups["body"].Value);
+        var from = FindTopLevelWord(tokens, 0, tokens.Count, "FROM");
+        var expressionEnd = from >= 0 ? from : tokens.Count;
+        if (FindTopLevelSymbol(tokens, 0, expressionEnd, ",") >= 0)
+        {
+            return false;
+        }
+        var locals = localTypes.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var expression = TranslateProceduralExpression(
+            TokenText(tokens, 0, expressionEnd), source, module, context, locals, targetType);
+        expression = expression.Trim().TrimEnd(';').TrimEnd();
+        var tailUnsupported = new List<string>();
+        var tail = from < 0
+            ? string.Empty
+            : TransformBody(TokenText(tokens, from, tokens.Count), source, module, context, out tailUnsupported);
+        if (tailUnsupported.Count > 0)
+        {
+            return false;
+        }
+        tail = RewriteVariables(tail, module, locals).Trim().TrimEnd(';');
+        sql = $"SELECT {expression} INTO v_{match.Groups["name"].Value.ToLowerInvariant()}" +
+              (tail.Length == 0 ? ";" : $" {tail};");
+        return true;
+    }
+
+    private static string TrimBalancedOuterParentheses(string value)
+    {
+        var trimmed = value.Trim();
+        while (trimmed.Length >= 2 && trimmed[0] == '(' && trimmed[^1] == ')')
+        {
+            var tokens = TSqlTokenizer.Tokenize(trimmed).ToList();
+            if (MatchingCloseParenthesis(tokens, 0) != tokens.Count - 1)
+            {
+                break;
+            }
+            trimmed = trimmed[1..^1].Trim();
+        }
+        return trimmed;
+    }
+
+    private static string NormalizeBooleanLocalComparisons(
+        string condition,
+        IReadOnlyDictionary<string, string> localTypes)
+    {
+        foreach (var (name, type) in localTypes)
+        {
+            if (!type.Equals("boolean", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            condition = Regex.Replace(
+                condition,
+                $@"@{Regex.Escape(name)}\s*(?<operator>=|<>)\s*(?<value>[01])\b",
+                match => $"@{name} {match.Groups["operator"].Value} " +
+                         (match.Groups["value"].Value == "1" ? "true" : "false"),
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        }
+        return condition;
+    }
+
     private static int FindWord(
         IReadOnlyList<TSqlToken> tokens,
         int start,
@@ -884,120 +2314,333 @@ public sealed partial class ProgrammableObjectConverter(
     }
 
     private static bool TryParseProceduralScalarBody(
-        string body,
-        InventoryObject source,
-        ModuleInventory module,
-        ConversionContext context,
-        out List<ProceduralLocal> declarations,
-        out List<string> statements,
-        out string unsupportedReason)
+     string body,
+     InventoryObject source,
+     ModuleInventory module,
+     ConversionContext context,
+     out List<ProceduralLocal> declarations,
+     out List<string> statements,
+     out string unsupportedReason)
     {
         declarations = [];
         statements = [];
         unsupportedReason = string.Empty;
+
+        /*
+         * This parser supports only flat procedural scalar bodies containing:
+         *
+         * - DECLARE
+         * - SET assignment
+         * - SELECT assignment
+         * - RETURN
+         *
+         * IF/ELSE control flow must be handled by
+         * TryConvertStructuredAssignmentIfBody.
+         *
+         * Without this guard, a statement such as:
+         *
+         *     SET @Return = 0
+         *     IF @cat_code = 'SK'
+         *
+         * can be incorrectly interpreted as one SET expression.
+         */
+        if (ContainsWord(body, "IF") ||
+            ContainsWord(body, "ELSE"))
+        {
+            unsupportedReason =
+                "structured IF/ELSE control flow must be handled by the structured scalar-function parser";
+            return false;
+        }
+
         var tokens = TSqlTokenizer.Tokenize(body);
         var starts = FindProceduralStatementStarts(tokens);
-        var localTypes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        var localNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var (start, ordinal) in starts.Select((value, index) => (value, index)))
+        if (starts.Count == 0)
         {
-            var end = ordinal + 1 < starts.Count ? starts[ordinal + 1] : tokens.Count;
-            end = TrimTrailingControlTokens(tokens, start + 1, end);
+            unsupportedReason =
+                "procedural scalar function contains no supported statements";
+            return false;
+        }
+
+        var localTypes =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        var localNames =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (start, ordinal) in
+                 starts.Select((value, index) => (value, index)))
+        {
+            var end = ordinal + 1 < starts.Count
+                ? starts[ordinal + 1]
+                : tokens.Count;
+
+            end = TrimTrailingControlTokens(
+                tokens,
+                start + 1,
+                end);
+
+            if (start < 0 ||
+                start >= tokens.Count ||
+                end <= start)
+            {
+                unsupportedReason =
+                    "malformed procedural statement boundary";
+                return false;
+            }
+
             var keyword = tokens[start].Text.ToUpperInvariant();
+
             if (keyword == "DECLARE")
             {
-                var variableIndex = NextSignificantIndex(tokens, start);
-                if (variableIndex < 0 || variableIndex >= end ||
-                    !tokens[variableIndex].Text.StartsWith('@'))
+                var variableIndex =
+                    NextSignificantIndex(tokens, start);
+
+             
+                if (variableIndex < 0 ||
+    variableIndex >= end ||
+    tokens[variableIndex].Text.Length == 0 ||
+    tokens[variableIndex].Text[0] != '@')
                 {
                     unsupportedReason = "malformed DECLARE statement";
                     return false;
                 }
+                var equalsIndex = FindTopLevelSymbol(
+                    tokens,
+                    variableIndex + 1,
+                    end,
+                    "=");
 
-                var equalsIndex = FindTopLevelSymbol(tokens, variableIndex + 1, end, "=");
-                var typeEnd = equalsIndex >= 0 ? equalsIndex : end;
-                var sourceType = TokenText(tokens, variableIndex + 1, typeEnd).Trim();
-                if (!TryMapLocalType(sourceType, context, out var targetType))
+                var typeEnd = equalsIndex >= 0
+                    ? equalsIndex
+                    : end;
+
+                var sourceType = TokenText(
+                        tokens,
+                        variableIndex + 1,
+                        typeEnd)
+                    .Trim();
+
+                if (string.IsNullOrWhiteSpace(sourceType))
                 {
-                    unsupportedReason = $"unsupported local variable type '{sourceType}'";
+                    unsupportedReason =
+                        "DECLARE statement has no local variable type";
                     return false;
                 }
 
-                var sourceName = tokens[variableIndex].Text[1..];
-                var targetName = $"v_{sourceName.ToLowerInvariant()}";
+                if (!TryMapLocalType(
+                        sourceType,
+                        context,
+                        out var targetType))
+                {
+                    unsupportedReason =
+                        $"unsupported local variable type '{sourceType}'";
+                    return false;
+                }
+
+                var sourceName =
+                    tokens[variableIndex].Text[1..];
+
+                if (string.IsNullOrWhiteSpace(sourceName))
+                {
+                    unsupportedReason =
+                        "DECLARE statement has an invalid local variable name";
+                    return false;
+                }
+
+                var targetName =
+                    $"v_{sourceName.ToLowerInvariant()}";
+
                 if (!localNames.Add(sourceName))
                 {
-                    unsupportedReason = $"duplicate local variable '@{sourceName}'";
+                    unsupportedReason =
+                        $"duplicate local variable '@{sourceName}'";
                     return false;
                 }
+
                 localTypes[sourceName] = targetType;
+
                 string? initializer = null;
+
                 if (equalsIndex >= 0)
                 {
+                    var initializerSource = TokenText(
+                            tokens,
+                            equalsIndex + 1,
+                            end)
+                        .Trim();
+
+                    if (string.IsNullOrWhiteSpace(initializerSource))
+                    {
+                        unsupportedReason =
+                            $"local variable '@{sourceName}' has an empty initializer";
+                        return false;
+                    }
+
                     initializer = TranslateProceduralExpression(
-                        TokenText(tokens, equalsIndex + 1, end),
+                        initializerSource,
                         source,
                         module,
                         context,
                         localNames,
                         targetType);
+
+                    if (string.IsNullOrWhiteSpace(initializer))
+                    {
+                        unsupportedReason =
+                            $"local variable '@{sourceName}' initializer could not be translated";
+                        return false;
+                    }
                 }
-                declarations.Add(new ProceduralLocal(
-                    sourceName,
-                    targetName,
-                    targetType,
-                    initializer));
+
+                declarations.Add(
+                    new ProceduralLocal(
+                        sourceName,
+                        targetName,
+                        targetType,
+                        initializer));
+
                 continue;
             }
 
             if (keyword == "SET")
             {
-                var variableIndex = NextSignificantIndex(tokens, start);
+                var variableIndex =
+                    NextSignificantIndex(tokens, start);
+
                 var equalsIndex = variableIndex >= 0
                     ? NextSignificantIndex(tokens, variableIndex)
                     : -1;
-                if (!TryResolveLocal(tokens, variableIndex, localNames, out var local) ||
-                    equalsIndex < 0 || tokens[equalsIndex].Text != "=")
+
+                if (!TryResolveLocal(
+                        tokens,
+                        variableIndex,
+                        localNames,
+                        out var local) ||
+                    equalsIndex < 0 ||
+                    equalsIndex >= end ||
+                    tokens[equalsIndex].Text != "=")
                 {
-                    unsupportedReason = "SET must assign a declared local variable";
+                    unsupportedReason =
+                        "SET must assign a declared local variable";
+                    return false;
+                }
+
+                var expressionSource = TokenText(
+                        tokens,
+                        equalsIndex + 1,
+                        end)
+                    .Trim();
+
+                if (string.IsNullOrWhiteSpace(expressionSource))
+                {
+                    unsupportedReason =
+                        $"SET assignment for '@{local}' has an empty expression";
+                    return false;
+                }
+
+                if (!localTypes.TryGetValue(
+                        local,
+                        out var localType))
+                {
+                    unsupportedReason =
+                        $"SET references unknown local variable '@{local}'";
                     return false;
                 }
 
                 var expression = TranslateProceduralExpression(
-                    TokenText(tokens, equalsIndex + 1, end),
+                    expressionSource,
                     source,
                     module,
                     context,
                     localNames,
-                    localTypes[local]);
-                statements.Add($"v_{local.ToLowerInvariant()} := {expression}");
+                    localType);
+
+                if (string.IsNullOrWhiteSpace(expression))
+                {
+                    unsupportedReason =
+                        $"SET expression for '@{local}' could not be translated";
+                    return false;
+                }
+
+                statements.Add(
+                    $"v_{local.ToLowerInvariant()} := {expression}");
+
                 continue;
             }
 
             if (keyword == "SELECT")
             {
-                var variableIndex = NextSignificantIndex(tokens, start);
+                var variableIndex =
+                    NextSignificantIndex(tokens, start);
+
                 var equalsIndex = variableIndex >= 0
                     ? NextSignificantIndex(tokens, variableIndex)
                     : -1;
-                if (!TryResolveLocal(tokens, variableIndex, localNames, out var local) ||
-                    equalsIndex < 0 || tokens[equalsIndex].Text != "=")
+
+                if (!TryResolveLocal(
+                        tokens,
+                        variableIndex,
+                        localNames,
+                        out var local) ||
+                    equalsIndex < 0 ||
+                    equalsIndex >= end ||
+                    tokens[equalsIndex].Text != "=")
                 {
-                    unsupportedReason = "only SELECT assignment to a declared local is supported";
+                    unsupportedReason =
+                        "only SELECT assignment to a declared local is supported";
                     return false;
                 }
 
-                var fromIndex = FindTopLevelWord(tokens, equalsIndex + 1, end, "FROM");
-                var expressionEnd = fromIndex >= 0 ? fromIndex : end;
+                if (!localTypes.TryGetValue(
+                        local,
+                        out var localType))
+                {
+                    unsupportedReason =
+                        $"SELECT assignment references unknown local variable '@{local}'";
+                    return false;
+                }
+
+                var fromIndex = FindTopLevelWord(
+                    tokens,
+                    equalsIndex + 1,
+                    end,
+                    "FROM");
+
+                var expressionEnd = fromIndex >= 0
+                    ? fromIndex
+                    : end;
+
+                var expressionSource = TokenText(
+                        tokens,
+                        equalsIndex + 1,
+                        expressionEnd)
+                    .Trim();
+
+                if (string.IsNullOrWhiteSpace(expressionSource))
+                {
+                    unsupportedReason =
+                        $"SELECT assignment for '@{local}' has an empty expression";
+                    return false;
+                }
+
                 var expression = TranslateProceduralExpression(
-                    TokenText(tokens, equalsIndex + 1, expressionEnd),
+                    expressionSource,
                     source,
                     module,
                     context,
                     localNames,
-                    localTypes[local]);
+                    localType);
+
+                if (string.IsNullOrWhiteSpace(expression))
+                {
+                    unsupportedReason =
+                        $"SELECT assignment expression for '@{local}' could not be translated";
+                    return false;
+                }
+
                 var tailUnsupported = new List<string>();
+
                 var tail = fromIndex < 0
                     ? string.Empty
                     : TransformBody(
@@ -1006,45 +2649,95 @@ public sealed partial class ProgrammableObjectConverter(
                         module,
                         context,
                         out tailUnsupported);
-                if (fromIndex >= 0 && tailUnsupported.Count > 0)
+
+                if (fromIndex >= 0 &&
+                    tailUnsupported.Count > 0)
                 {
                     unsupportedReason =
-                        $"unsupported SELECT assignment: {string.Join(", ", tailUnsupported)}";
+                        $"unsupported SELECT assignment: " +
+                        $"{string.Join(", ", tailUnsupported)}";
                     return false;
                 }
-                tail = RewriteVariables(tail, module, localNames);
+
+                tail = RewriteVariables(
+                    tail,
+                    module,
+                    localNames);
+
                 statements.Add(
-                    $"SELECT {expression} INTO v_{local.ToLowerInvariant()}" +
-                    (string.IsNullOrWhiteSpace(tail) ? string.Empty : $" {tail.Trim()}"));
+                    $"SELECT {expression} " +
+                    $"INTO v_{local.ToLowerInvariant()}" +
+                    (string.IsNullOrWhiteSpace(tail)
+                        ? string.Empty
+                        : $" {tail.Trim()}"));
+
                 continue;
             }
 
             if (keyword == "RETURN")
             {
+                var returnSource = TokenText(
+                        tokens,
+                        start + 1,
+                        end)
+                    .Trim();
+
+                if (string.IsNullOrWhiteSpace(returnSource))
+                {
+                    unsupportedReason =
+                        "empty RETURN expression";
+                    return false;
+                }
+
+                var returnType =
+                    MapReturnType(module, context);
+
+                if (returnType is null)
+                {
+                    unsupportedReason =
+                        "procedural scalar function return type could not be mapped";
+                    return false;
+                }
+
                 var expression = TranslateProceduralExpression(
-                    TokenText(tokens, start + 1, end),
+                    returnSource,
                     source,
                     module,
                     context,
                     localNames,
-                    returnType: null);
+                    returnType);
+
                 if (string.IsNullOrWhiteSpace(expression))
                 {
-                    unsupportedReason = "empty RETURN expression";
+                    unsupportedReason =
+                        "RETURN expression could not be translated";
                     return false;
                 }
+
                 statements.Add($"RETURN {expression}");
+
                 continue;
             }
 
-            unsupportedReason = $"unsupported procedural statement '{tokens[start].Text}'";
+            unsupportedReason =
+                $"unsupported procedural statement '{tokens[start].Text}'";
             return false;
         }
 
-        if (statements.Count == 0 ||
-            !statements.Any(item => item.TrimStart().StartsWith("RETURN ", StringComparison.OrdinalIgnoreCase)))
+        if (statements.Count == 0)
         {
-            unsupportedReason = "procedural function has no supported RETURN statement";
+            unsupportedReason =
+                "procedural function contains no supported executable statements";
+            return false;
+        }
+
+        if (!statements.Any(item =>
+                item.TrimStart().StartsWith(
+                    "RETURN ",
+                    StringComparison.OrdinalIgnoreCase)))
+        {
+            unsupportedReason =
+                "procedural function has no supported RETURN statement";
             return false;
         }
 
@@ -1300,8 +2993,14 @@ public sealed partial class ProgrammableObjectConverter(
                 tokens[hint].Text.Equals("NOLOCK", StringComparison.OrdinalIgnoreCase) &&
                 tokens[close].Text == ")")
             {
-                tokens.RemoveRange(index, close - index + 1);
-                index--;
+                var with = PreviousSignificant(tokens, index);
+                var removeFrom = with >= 0 &&
+                                 tokens[with].Kind == TSqlTokenKind.Word &&
+                                 tokens[with].Text.Equals("WITH", StringComparison.OrdinalIgnoreCase)
+                    ? with
+                    : index;
+                tokens.RemoveRange(removeFrom, close - removeFrom + 1);
+                index = Math.Max(-1, removeFrom - 1);
             }
         }
         return string.Concat(tokens.Select(item => item.Text));
@@ -1525,6 +3224,21 @@ public sealed partial class ProgrammableObjectConverter(
                     };
                     continue;
                 }
+
+                var globallyUniqueObject = context.Inventory.Objects
+                    .Where(item =>
+                        item.Id != source.Id &&
+                        item.ObjectType is InventoryObjectType.Table or InventoryObjectType.View &&
+                        item.SourceName.Equals(singleIdentifier, StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
+                if (globallyUniqueObject.Length == 1)
+                {
+                    tokens[index] = tokens[index] with
+                    {
+                        Text = context.Identifiers.MapObject(globallyUniqueObject[0]).QualifiedName
+                    };
+                    continue;
+                }
             }
 
             if (FindColumn(context, relatedObjects, singleIdentifier) is { } column &&
@@ -1670,12 +3384,24 @@ public sealed partial class ProgrammableObjectConverter(
 
     private static string? ExtractAfterAs(string definition)
     {
-        var tokens = TSqlTokenizer.Tokenize(definition);
+        var tokens = TSqlTokenizer.Tokenize(definition).ToList();
+        var depth = 0;
         for (var index = 0; index < tokens.Count; index++)
         {
-            if (tokens[index].Kind == TSqlTokenKind.Word &&
-                tokens[index].Text.Equals("AS", StringComparison.OrdinalIgnoreCase))
+            if (tokens[index].Kind is not TSqlTokenKind.String and not TSqlTokenKind.Comment)
             {
+                depth += tokens[index].Text switch { "(" => 1, ")" => -1, _ => 0 };
+            }
+            if (tokens[index].Kind == TSqlTokenKind.Word &&
+                tokens[index].Text.Equals("AS", StringComparison.OrdinalIgnoreCase) &&
+                depth == 0)
+            {
+                var previous = PreviousSignificant(tokens, index);
+                if (previous >= 0 && tokens[previous].Kind == TSqlTokenKind.Word &&
+                    tokens[previous].Text.Equals("EXECUTE", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
                 return string.Concat(tokens.Skip(index + 1).Select(item => item.Text)).Trim();
             }
         }
@@ -1699,12 +3425,26 @@ public sealed partial class ProgrammableObjectConverter(
             return null;
         }
         var result = new StringBuilder();
+        var caseDepth = 0;
         foreach (var token in tokens.Skip(returnIndex + 1))
         {
-            if (token.Text == ";" ||
-                token.Kind == TSqlTokenKind.Word && token.Text.Equals("END", StringComparison.OrdinalIgnoreCase))
+            if (token.Text == ";")
             {
                 break;
+            }
+            if (token.Kind == TSqlTokenKind.Word &&
+                token.Text.Equals("CASE", StringComparison.OrdinalIgnoreCase))
+            {
+                caseDepth++;
+            }
+            else if (token.Kind == TSqlTokenKind.Word &&
+                     token.Text.Equals("END", StringComparison.OrdinalIgnoreCase))
+            {
+                if (caseDepth == 0)
+                {
+                    break;
+                }
+                caseDepth--;
             }
             result.Append(token.Text);
         }
@@ -1792,12 +3532,38 @@ public sealed partial class ProgrammableObjectConverter(
         return trimmed;
     }
 
-    private static string RemoveSqlServerSessionStatements(string sql) =>
-        Regex.Replace(
-            sql,
-            @"(?im)^\s*SET\s+(?:NOCOUNT|XACT_ABORT)\s+ON\s*;\s*$",
-            string.Empty,
-            RegexOptions.CultureInvariant);
+    private static string RemoveSqlServerSessionStatements(string sql)
+    {
+        var tokens = TSqlTokenizer.Tokenize(sql).ToList();
+        for (var index = 0; index < tokens.Count; index++)
+        {
+            if (tokens[index].Kind != TSqlTokenKind.Word ||
+                !tokens[index].Text.Equals("SET", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            var directive = NextSignificantIndex(tokens, index);
+            var value = directive >= 0 ? NextSignificantIndex(tokens, directive) : -1;
+            if (directive < 0 || value < 0 ||
+                !tokens[directive].Text.Equals("NOCOUNT", StringComparison.OrdinalIgnoreCase) &&
+                !tokens[directive].Text.Equals("XACT_ABORT", StringComparison.OrdinalIgnoreCase) &&
+                !tokens[directive].Text.Equals("ANSI_WARNINGS", StringComparison.OrdinalIgnoreCase) ||
+                !tokens[value].Text.Equals("ON", StringComparison.OrdinalIgnoreCase) &&
+                !tokens[value].Text.Equals("OFF", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            tokens[index] = tokens[index] with { Text = string.Empty };
+            tokens[directive] = tokens[directive] with { Text = string.Empty };
+            tokens[value] = tokens[value] with { Text = string.Empty };
+            var terminator = NextSignificantIndex(tokens, value);
+            if (terminator >= 0 && tokens[terminator].Text == ";")
+            {
+                tokens[terminator] = tokens[terminator] with { Text = string.Empty };
+            }
+        }
+        return string.Concat(tokens.Select(item => item.Text));
+    }
 
     private static bool ContainsAny(string value, params string[] fragments) =>
         fragments.Any(fragment => value.Contains(fragment, StringComparison.OrdinalIgnoreCase));
@@ -1806,6 +3572,37 @@ public sealed partial class ProgrammableObjectConverter(
         TSqlTokenizer.Tokenize(sql).Any(token =>
             token.Kind == TSqlTokenKind.Word &&
             token.Text.Equals(word, StringComparison.OrdinalIgnoreCase));
+
+    private static bool HasResidualProceduralSyntax(string sql)
+    {
+        var tokens = TSqlTokenizer.Tokenize(sql);
+        for (var index = 0; index < tokens.Count; index++)
+        {
+            var token = tokens[index];
+            if (token.Kind != TSqlTokenKind.Word)
+            {
+                continue;
+            }
+            if (token.Text.StartsWith('@') ||
+                token.Text.Equals("PRINT", StringComparison.OrdinalIgnoreCase) ||
+                token.Text.Equals("DECLARE", StringComparison.OrdinalIgnoreCase) ||
+                token.Text.Equals("NOCOUNT", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+            if (token.Text.Equals("SET", StringComparison.OrdinalIgnoreCase))
+            {
+                var target = NextSignificantIndex(tokens, index);
+                if (target >= 0 && tokens[target].Kind == TSqlTokenKind.Word &&
+                    (tokens[target].Text.StartsWith("v_", StringComparison.OrdinalIgnoreCase) ||
+                     tokens[target].Text.StartsWith("p_", StringComparison.OrdinalIgnoreCase)))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
 
     private static bool HasMultipartName(string sql, int minimumParts)
     {
