@@ -2,6 +2,7 @@ using System.Data.Common;
 using System.Globalization;
 using System.Buffers.Binary;
 using System.Security.Cryptography;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Data.SqlClient;
@@ -91,12 +92,21 @@ public sealed class PostMigrationValidationEngine(
     {
         var comparisons = new List<ObjectComparison>();
         var mappedTargets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var targetObjects = target.Objects.ToLookup(
+            item => TargetObjectKey(item.Schema, item.Name, item.ObjectType),
+            StringComparer.Ordinal);
         var includedObjects = request.SourceSnapshot.Objects.Where(item =>
             item.IsIncluded && request.Configuration.Scope.Includes(
                 item.SourceSchema, item.ObjectType, item.QualifiedSourceName));
+
         foreach (var source in includedObjects)
         {
-            if (!TryMapping(request.Conversion, source.Id, source.ObjectType.ToString(), source.SourceName, out var mapping))
+            if (!TryMapping(
+                    request.Conversion,
+                    source.Id,
+                    source.ObjectType.ToString(),
+                    source.SourceName,
+                    out var mapping))
             {
                 Add(findings, request, "STRUCTURE.MAPPING_MISSING", ValidationCategory.StructuralCompleteness,
                     ComparisonClassification.NotComparable, source.ObjectType.ToString(), source.QualifiedSourceName,
@@ -107,10 +117,7 @@ public sealed class PostMigrationValidationEngine(
             var targetSchema = Unquote(mapping.TargetSchema);
             var targetName = Unquote(mapping.TargetName);
             var expectedType = TargetTypeName(source.ObjectType);
-            var match = target.Objects.FirstOrDefault(item =>
-                item.Schema.Equals(targetSchema, StringComparison.OrdinalIgnoreCase) &&
-                item.Name.Equals(targetName, StringComparison.OrdinalIgnoreCase) &&
-                item.ObjectType.Equals(expectedType, StringComparison.OrdinalIgnoreCase));
+            var match = targetObjects[TargetObjectKey(targetSchema, targetName, expectedType)].LastOrDefault();
             var classification = match is null ? ComparisonClassification.Missing : ComparisonClassification.Equivalent;
             var detail = match is null ? "Mapped target object was not found." : "Mapped target object exists.";
             var sourceComment = source.ExtendedProperties.FirstOrDefault(item =>
@@ -123,6 +130,7 @@ public sealed class PostMigrationValidationEngine(
                     : ComparisonClassification.Warning;
                 detail += " Object comment differs or is missing.";
             }
+
             var ruleId =
                 source.ObjectType == InventoryObjectType.Table &&
                 classification == ComparisonClassification.Missing
@@ -174,6 +182,10 @@ public sealed class PostMigrationValidationEngine(
         List<ObjectComparison> comparisons)
     {
         var objects = request.SourceSnapshot.Objects.ToDictionary(item => item.Id);
+        var targetColumns = target.Columns.ToLookup(
+            item => TargetMemberKey(item.Schema, item.Table, item.Name),
+            StringComparer.Ordinal);
+
         foreach (var source in request.SourceSnapshot.Columns)
         {
             if (!objects.TryGetValue(source.ParentObjectId, out var table) || !table.IsIncluded ||
@@ -183,6 +195,7 @@ public sealed class PostMigrationValidationEngine(
             {
                 continue;
             }
+
             var columnMap = FindColumnMapping(request.Conversion, source);
             if (columnMap is null)
             {
@@ -192,14 +205,12 @@ public sealed class PostMigrationValidationEngine(
                     "Column mapping is missing; direct name comparison is prohibited.");
                 continue;
             }
+
             var targetSchema = Unquote(tableMap.TargetSchema);
             var targetTable = Unquote(tableMap.TargetName);
             var targetColumnName = Unquote(columnMap.TargetName);
-
-            var targetColumn = target.Columns.FirstOrDefault(item =>
-                item.Schema.Equals(targetSchema, StringComparison.OrdinalIgnoreCase) &&
-                item.Table.Equals(targetTable, StringComparison.OrdinalIgnoreCase) &&
-                item.Name.Equals(targetColumnName, StringComparison.OrdinalIgnoreCase));
+            var targetColumn = targetColumns[
+                TargetMemberKey(targetSchema, targetTable, targetColumnName)].LastOrDefault();
 
             var sourceName = $"{table.QualifiedSourceName}.{source.Name}";
             var targetName = $"{targetSchema}.{targetTable}.{targetColumnName}";
@@ -277,6 +288,15 @@ public sealed class PostMigrationValidationEngine(
         List<ObjectComparison> comparisons)
     {
         var objects = request.SourceSnapshot.Objects.ToDictionary(item => item.Id);
+        var constraintMappings = request.Conversion.IdentifierMappings
+            .Where(item => item.ObjectType.Contains("Constraint", StringComparison.OrdinalIgnoreCase))
+            .ToLookup(
+                item => MappingNameKey(item.SourceObjectId, item.SourceName),
+                StringComparer.Ordinal);
+        var targetConstraints = target.Constraints.ToLookup(
+            item => TargetMemberKey(item.Schema, item.Table, item.Name),
+            StringComparer.Ordinal);
+
         foreach (var source in request.SourceSnapshot.Constraints.Where(item =>
                      item.Kind != ConstraintKind.Default))
         {
@@ -285,18 +305,19 @@ public sealed class PostMigrationValidationEngine(
             {
                 continue;
             }
-            var nameMap = request.Conversion.IdentifierMappings.LastOrDefault(item =>
-                item.SourceObjectId == table.Id &&
-                item.ObjectType.Contains("Constraint", StringComparison.OrdinalIgnoreCase) &&
-                item.SourceName.Equals(source.Name, StringComparison.OrdinalIgnoreCase));
+
+            var nameMap = constraintMappings[
+                MappingNameKey(table.Id, source.Name)].LastOrDefault();
             if (nameMap is null)
             {
                 continue;
             }
-            var match = target.Constraints.FirstOrDefault(item =>
-                item.Schema.Equals(Unquote(tableMap.TargetSchema), StringComparison.OrdinalIgnoreCase) &&
-                item.Table.Equals(Unquote(tableMap.TargetName), StringComparison.OrdinalIgnoreCase) &&
-                item.Name.Equals(Unquote(nameMap.TargetName), StringComparison.OrdinalIgnoreCase));
+
+            var targetSchema = Unquote(tableMap.TargetSchema);
+            var targetTable = Unquote(tableMap.TargetName);
+            var targetConstraintName = Unquote(nameMap.TargetName);
+            var match = targetConstraints[
+                TargetMemberKey(targetSchema, targetTable, targetConstraintName)].LastOrDefault();
             var classification = match is null
                 ? ComparisonClassification.Missing
                 : match.IsValidated ? ComparisonClassification.Equivalent : ComparisonClassification.Warning;
@@ -351,6 +372,10 @@ public sealed class PostMigrationValidationEngine(
         List<ObjectComparison> comparisons)
     {
         var objects = request.SourceSnapshot.Objects.ToDictionary(item => item.Id);
+        var targetIndexes = target.Indexes.ToLookup(
+            item => TargetMemberKey(item.Schema, item.Table, item.Name),
+            StringComparer.Ordinal);
+
         foreach (var source in request.SourceSnapshot.Indexes.Where(item =>
                      !item.IsPrimaryKey && !item.IsUniqueConstraint))
         {
@@ -359,18 +384,17 @@ public sealed class PostMigrationValidationEngine(
             {
                 continue;
             }
-            var nameMap = request.Conversion.IdentifierMappings.LastOrDefault(item =>
-                item.SourceObjectId == table.Id &&
-                item.ObjectType.Equals("Index", StringComparison.OrdinalIgnoreCase) &&
-                item.SourceName.Equals(source.Name, StringComparison.OrdinalIgnoreCase));
-            if (nameMap is null)
+
+            if (!TryMapping(request.Conversion, table.Id, "Index", source.Name, out var nameMap))
             {
                 continue;
             }
-            var match = target.Indexes.FirstOrDefault(item =>
-                item.Schema.Equals(Unquote(tableMap.TargetSchema), StringComparison.OrdinalIgnoreCase) &&
-                item.Table.Equals(Unquote(tableMap.TargetName), StringComparison.OrdinalIgnoreCase) &&
-                item.Name.Equals(Unquote(nameMap.TargetName), StringComparison.OrdinalIgnoreCase));
+
+            var targetSchema = Unquote(tableMap.TargetSchema);
+            var targetTable = Unquote(tableMap.TargetName);
+            var targetIndexName = Unquote(nameMap.TargetName);
+            var match = targetIndexes[
+                TargetMemberKey(targetSchema, targetTable, targetIndexName)].LastOrDefault();
             var classification = match is null ? ComparisonClassification.Missing :
                 match.IsValid ? ComparisonClassification.Equivalent : ComparisonClassification.Mismatch;
             var detail = match is null ? "Mapped index is missing." :
@@ -409,75 +433,198 @@ public sealed class PostMigrationValidationEngine(
         IProgress<ValidationProgress>? progress,
         CancellationToken cancellationToken)
     {
+        const int maxDegreeOfParallelism = 4;
+
         var tables = request.SourceSnapshot.Objects.Where(item =>
-            item.IsIncluded && item.ObjectType == InventoryObjectType.Table &&
-            request.Configuration.Scope.Includes(item.SourceSchema, item.ObjectType, item.QualifiedSourceName)).ToArray();
-        var results = new List<TableDataComparison>();
-        await using var source = new SqlConnection(request.Connections.SourceConnectionString);
-        await using var target = new NpgsqlConnection(request.Connections.TargetConnectionString);
-        await source.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await target.OpenAsync(cancellationToken).ConfigureAwait(false);
-        for (var index = 0; index < tables.Length; index++)
+            item.IsIncluded &&
+            item.ObjectType == InventoryObjectType.Table &&
+            request.Configuration.Scope.Includes(
+                item.SourceSchema, item.ObjectType, item.QualifiedSourceName)).ToArray();
+
+        if (tables.Length == 0)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var table = tables[index];
-            progress?.Report(new ValidationProgress("Data", index, tables.Length, table.QualifiedSourceName));
-            if (!TryMapping(request.Conversion, table.Id, table.ObjectType.ToString(), table.SourceName, out var mapping))
-            {
-                continue;
-            }
-            var sourceCount = await CountAsync(
-                source, $"{QuoteSqlServer(table.SourceSchema)}.{QuoteSqlServer(table.SourceName)}",
-                cancellationToken).ConfigureAwait(false);
-            var targetCount = await CountAsync(
-                target, $"{QuotePostgreSql(Unquote(mapping.TargetSchema))}.{QuotePostgreSql(Unquote(mapping.TargetName))}",
-                cancellationToken).ConfigureAwait(false);
-            string? sourceHash = null;
-            string? targetHash = null;
-            IReadOnlyList<ColumnDataMetric> sourceMetrics = [];
-            IReadOnlyList<ColumnDataMetric> targetMetrics = [];
-            var ordered = false;
-            if (request.Configuration.Level is ValidationLevel.DataSampling or
-                ValidationLevel.DataComprehensive or ValidationLevel.Full)
-            {
-                var columns = request.SourceSnapshot.Columns
-                    .Where(item => item.ParentObjectId == table.Id && !item.IsComputed)
-                    .OrderBy(item => item.OrdinalPosition).ToArray();
-                var keyColumns = request.SourceSnapshot.Constraints
-                    .FirstOrDefault(item => item.TableObjectId == table.Id && item.Kind == ConstraintKind.PrimaryKey)
-                    ?.Columns.OrderBy(item => item.Ordinal).Select(item => item.Name).ToArray() ?? [];
-                ordered = keyColumns.Length > 0;
-                var limit = request.Configuration.Level == ValidationLevel.DataSampling
-                    ? request.Configuration.SampleSize : int.MaxValue;
-                var sourceProfile = await ProfileRowsAsync(
-                    source, table, mapping, request.Conversion, columns, keyColumns, limit, true,
-                    request.Configuration, cancellationToken).ConfigureAwait(false);
-                var targetProfile = await ProfileRowsAsync(
-                    target, table, mapping, request.Conversion, columns, keyColumns, limit, false,
-                    request.Configuration, cancellationToken).ConfigureAwait(false);
-                sourceHash = sourceProfile.Checksum;
-                targetHash = targetProfile.Checksum;
-                sourceMetrics = sourceProfile.Metrics;
-                targetMetrics = targetProfile.Metrics;
-            }
-            var classification = sourceCount != targetCount
-                ? ComparisonClassification.Mismatch
-                : sourceHash is not null && !string.Equals(sourceHash, targetHash, StringComparison.Ordinal)
-                    ? ComparisonClassification.Mismatch
-                    : ComparisonClassification.Equivalent;
-            var detail = sourceCount != targetCount
-                ? $"Row counts differ ({sourceCount} source, {targetCount} target)."
-                : sourceHash is not null && classification == ComparisonClassification.Mismatch
-                    ? "Canonical data checksums differ; values are not included in the finding."
-                    : sourceHash is null ? "Row counts match." : "Row counts and canonical checksums match.";
-            Add(findings, request, sourceCount != targetCount ? "DATA.ROW_COUNT" : "DATA.CHECKSUM",
-                ValidationCategory.DataReconciliation, classification, "Table",
-                table.QualifiedSourceName, mapping.TargetQualifiedName, detail);
-            results.Add(new TableDataComparison(
-                table.QualifiedSourceName, mapping.TargetQualifiedName, sourceCount, targetCount,
-                sourceHash, targetHash, ordered, sourceMetrics, targetMetrics, classification, detail));
+            return [];
         }
-        return results;
+
+        var columnsByTable = request.SourceSnapshot.Columns
+            .Where(item => !item.IsComputed)
+            .GroupBy(item => item.ParentObjectId)
+            .ToDictionary(
+                group => group.Key,
+                group => group.OrderBy(item => item.OrdinalPosition).ToArray());
+
+        var primaryKeysByTable = request.SourceSnapshot.Constraints
+            .Where(item => item.Kind == ConstraintKind.PrimaryKey)
+            .GroupBy(item => item.TableObjectId)
+            .ToDictionary(
+                group => group.Key,
+                group => group.First().Columns
+                    .OrderBy(item => item.Ordinal)
+                    .Select(item => item.Name)
+                    .ToArray());
+
+        var results = new TableDataComparison?[tables.Length];
+        var findingBuffer = new ValidationFinding?[tables.Length];
+        var completed = 0;
+
+        await Parallel.ForEachAsync(
+            Enumerable.Range(0, tables.Length),
+            new ParallelOptions
+            {
+                MaxDegreeOfParallelism = Math.Min(maxDegreeOfParallelism, tables.Length),
+                CancellationToken = cancellationToken
+            },
+            async (tableIndex, token) =>
+            {
+                token.ThrowIfCancellationRequested();
+                var table = tables[tableIndex];
+
+                if (!TryMapping(
+                        request.Conversion,
+                        table.Id,
+                        table.ObjectType.ToString(),
+                        table.SourceName,
+                        out var mapping))
+                {
+                    var skipped = Interlocked.Increment(ref completed);
+                    progress?.Report(new ValidationProgress(
+                        "Data", skipped, tables.Length,
+                        $"{table.QualifiedSourceName} (mapping missing; skipped)"));
+                    return;
+                }
+
+                // Each parallel worker owns separate connections. ADO.NET
+                // connections/readers are not shared between concurrent tables.
+                await using var source =
+                    new SqlConnection(request.Connections.SourceConnectionString);
+                await using var target =
+                    new NpgsqlConnection(request.Connections.TargetConnectionString);
+
+                await Task.WhenAll(
+                    source.OpenAsync(token),
+                    target.OpenAsync(token)).ConfigureAwait(false);
+
+                var sourceRelation =
+                    $"{QuoteSqlServer(table.SourceSchema)}.{QuoteSqlServer(table.SourceName)}";
+                var targetRelation =
+                    $"{QuotePostgreSql(Unquote(mapping.TargetSchema))}.{QuotePostgreSql(Unquote(mapping.TargetName))}";
+
+                var sourceCountTask = CountAsync(source, sourceRelation, token);
+                var targetCountTask = CountAsync(target, targetRelation, token);
+                await Task.WhenAll(sourceCountTask, targetCountTask).ConfigureAwait(false);
+
+                var sourceCount = await sourceCountTask.ConfigureAwait(false);
+                var targetCount = await targetCountTask.ConfigureAwait(false);
+
+                string? sourceHash = null;
+                string? targetHash = null;
+                IReadOnlyList<ColumnDataMetric> sourceMetrics = [];
+                IReadOnlyList<ColumnDataMetric> targetMetrics = [];
+                var ordered = false;
+
+                if (request.Configuration.Level is ValidationLevel.DataSampling or
+                    ValidationLevel.DataComprehensive or ValidationLevel.Full)
+                {
+                    columnsByTable.TryGetValue(table.Id, out var columns);
+                    columns ??= [];
+
+                    primaryKeysByTable.TryGetValue(table.Id, out var keyColumns);
+                    keyColumns ??= [];
+
+                    ordered = keyColumns.Length > 0;
+
+                    var limit = request.Configuration.Level == ValidationLevel.DataSampling
+                        ? request.Configuration.SampleSize
+                        : int.MaxValue;
+
+                    if (columns.Length > 0)
+                    {
+                        var sourceProfileTask = ProfileRowsAsync(
+                            source, table, mapping, request.Conversion,
+                            columns, keyColumns, limit, true,
+                            request.Configuration, token);
+
+                        var targetProfileTask = ProfileRowsAsync(
+                            target, table, mapping, request.Conversion,
+                            columns, keyColumns, limit, false,
+                            request.Configuration, token);
+
+                        await Task.WhenAll(sourceProfileTask, targetProfileTask).ConfigureAwait(false);
+
+                        var sourceProfile = await sourceProfileTask.ConfigureAwait(false);
+                        var targetProfile = await targetProfileTask.ConfigureAwait(false);
+
+                        sourceHash = sourceProfile.Checksum;
+                        targetHash = targetProfile.Checksum;
+                        sourceMetrics = sourceProfile.Metrics;
+                        targetMetrics = targetProfile.Metrics;
+                    }
+                }
+
+                var classification = sourceCount != targetCount
+                    ? ComparisonClassification.Mismatch
+                    : sourceHash is not null &&
+                      !string.Equals(sourceHash, targetHash, StringComparison.Ordinal)
+                        ? ComparisonClassification.Mismatch
+                        : ComparisonClassification.Equivalent;
+
+                var detail = sourceCount != targetCount
+                    ? $"Row counts differ ({sourceCount} source, {targetCount} target)."
+                    : sourceHash is not null &&
+                      classification == ComparisonClassification.Mismatch
+                        ? "Canonical data checksums differ; values are not included in the finding."
+                        : sourceHash is null
+                            ? "Row counts match."
+                            : "Row counts and canonical checksums match.";
+
+                var ruleId = sourceCount != targetCount ? "DATA.ROW_COUNT" : "DATA.CHECKSUM";
+                var severity = ValidationSeverityPolicy.Resolve(
+                    ruleId, classification, request.Configuration);
+
+                // Buffer per-table output; merge after parallel work so the shared
+                // List<ValidationFinding> is never written concurrently.
+                findingBuffer[tableIndex] = new ValidationFinding(
+                    ruleId,
+                    ValidationCategory.DataReconciliation,
+                    severity,
+                    classification,
+                    "Table",
+                    table.QualifiedSourceName,
+                    mapping.TargetQualifiedName,
+                    detail,
+                    null,
+                    null);
+
+                results[tableIndex] = new TableDataComparison(
+                    table.QualifiedSourceName,
+                    mapping.TargetQualifiedName,
+                    sourceCount,
+                    targetCount,
+                    sourceHash,
+                    targetHash,
+                    ordered,
+                    sourceMetrics,
+                    targetMetrics,
+                    classification,
+                    detail);
+
+                var done = Interlocked.Increment(ref completed);
+                progress?.Report(new ValidationProgress(
+                    "Data", done, tables.Length, table.QualifiedSourceName));
+            }).ConfigureAwait(false);
+
+        foreach (var finding in findingBuffer)
+        {
+            if (finding is not null)
+            {
+                findings.Add(finding);
+            }
+        }
+
+        return results
+            .Where(item => item is not null)
+            .Select(item => item!)
+            .ToArray();
     }
 
     private async Task<DataProfile> ProfileRowsAsync(
@@ -1327,38 +1474,115 @@ public sealed class PostMigrationValidationEngine(
         return severity;
     }
 
+    private static readonly ConditionalWeakTable<ConversionRun, MappingLookup> MappingLookupCache = new();
+
     private static bool TryMapping(
         ConversionRun conversion,
         InventoryObjectId sourceId,
         string objectType,
         string sourceName,
-        out IdentifierMappingEntry mapping)
-    {
-        mapping = conversion.IdentifierMappings.LastOrDefault(item =>
-            item.SourceObjectId == sourceId &&
-            item.ObjectType.Equals(objectType, StringComparison.OrdinalIgnoreCase) &&
-            (string.IsNullOrEmpty(sourceName) ||
-             item.SourceName.Equals(sourceName, StringComparison.OrdinalIgnoreCase)))!;
-        return mapping is not null;
-    }
+        out IdentifierMappingEntry mapping) =>
+        GetMappingLookup(conversion).TryGet(sourceId, objectType, sourceName, out mapping);
 
     private static IdentifierMappingEntry? FindColumnMapping(
         ConversionRun conversion,
-        ColumnInventory column)
+        ColumnInventory column) =>
+        GetMappingLookup(conversion).FindColumn(column);
+
+    private static MappingLookup GetMappingLookup(ConversionRun conversion) =>
+        MappingLookupCache.GetValue(conversion, static value => new MappingLookup(value));
+
+    private static string NormalizeLookupPart(string value) =>
+        value.ToUpperInvariant();
+
+    private static string MappingNameKey(InventoryObjectId owner, string name) =>
+        $"{owner}\u001F{NormalizeLookupPart(name)}";
+
+    private static string TargetObjectKey(string schema, string name, string objectType) =>
+        $"{NormalizeLookupPart(schema)}\u001F{NormalizeLookupPart(name)}\u001F{NormalizeLookupPart(objectType)}";
+
+    private static string TargetMemberKey(string schema, string table, string name) =>
+        $"{NormalizeLookupPart(schema)}\u001F{NormalizeLookupPart(table)}\u001F{NormalizeLookupPart(name)}";
+
+    private sealed class MappingLookup
     {
-        /*
-         * Current packages identify a column mapping by the column object ID.
-         * The table-ID fallback keeps older persisted conversion packages
-         * readable without allowing a same-named column from another table
-         * to be selected first.
-         */
-        return conversion.IdentifierMappings.LastOrDefault(item =>
-                   item.SourceObjectId == column.ObjectId &&
-                   item.ObjectType.Equals("Column", StringComparison.OrdinalIgnoreCase))
-               ?? conversion.IdentifierMappings.LastOrDefault(item =>
-                   item.SourceObjectId == column.ParentObjectId &&
-                   item.ObjectType.Equals("Column", StringComparison.OrdinalIgnoreCase) &&
-                   item.SourceName.Equals(column.Name, StringComparison.OrdinalIgnoreCase));
+        private readonly Dictionary<string, IdentifierMappingEntry> exact =
+            new(StringComparer.Ordinal);
+        private readonly Dictionary<string, IdentifierMappingEntry> anyName =
+            new(StringComparer.Ordinal);
+        private readonly Dictionary<InventoryObjectId, IdentifierMappingEntry> columnsByObjectId = [];
+        private readonly Dictionary<string, IdentifierMappingEntry> columnsByOwnerAndName =
+            new(StringComparer.Ordinal);
+
+        public MappingLookup(ConversionRun conversion)
+        {
+            foreach (var item in conversion.IdentifierMappings)
+            {
+                var objectType = NormalizeLookupPart(item.ObjectType);
+                var sourceName = NormalizeLookupPart(item.SourceName);
+                exact[ExactKey(item.SourceObjectId, objectType, sourceName)] = item;
+                anyName[AnyKey(item.SourceObjectId, objectType)] = item;
+
+                if (!item.ObjectType.Equals("Column", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                // Last assignment intentionally preserves LastOrDefault semantics.
+                columnsByObjectId[item.SourceObjectId] = item;
+                columnsByOwnerAndName[MappingNameKey(item.SourceObjectId, item.SourceName)] = item;
+            }
+        }
+
+        public bool TryGet(
+            InventoryObjectId sourceId,
+            string objectType,
+            string sourceName,
+            out IdentifierMappingEntry mapping)
+        {
+            var normalizedType = NormalizeLookupPart(objectType);
+            if (string.IsNullOrEmpty(sourceName))
+            {
+                return anyName.TryGetValue(AnyKey(sourceId, normalizedType), out mapping!);
+            }
+
+            return exact.TryGetValue(
+                ExactKey(sourceId, normalizedType, NormalizeLookupPart(sourceName)),
+                out mapping!);
+        }
+
+        public IdentifierMappingEntry? FindColumn(ColumnInventory column)
+        {
+            if (columnsByObjectId.TryGetValue(column.ObjectId, out var mapping))
+            {
+                return mapping;
+            }
+
+            return columnsByOwnerAndName.TryGetValue(
+                MappingNameKey(column.ParentObjectId, column.Name), out mapping)
+                ? mapping
+                : null;
+        }
+
+        public string[] MapChildNames(
+            InventoryObjectId owner,
+            IEnumerable<string> sourceNames) =>
+            sourceNames.Select(name =>
+                Unquote(columnsByOwnerAndName.TryGetValue(
+                    MappingNameKey(owner, name), out var mapping)
+                    ? mapping.TargetName
+                    : name)).ToArray();
+
+        private static string ExactKey(
+            InventoryObjectId sourceId,
+            string normalizedObjectType,
+            string normalizedSourceName) =>
+            $"{sourceId}\u001F{normalizedObjectType}\u001F{normalizedSourceName}";
+
+        private static string AnyKey(
+            InventoryObjectId sourceId,
+            string normalizedObjectType) =>
+            $"{sourceId}\u001F{normalizedObjectType}";
     }
 
     private static async Task<string?> ResolveTargetColumnAsync(
@@ -1419,11 +1643,7 @@ public sealed class PostMigrationValidationEngine(
         ConversionRun conversion,
         InventoryObjectId owner,
         IEnumerable<string> sourceNames) =>
-        sourceNames.Select(name =>
-            Unquote(conversion.IdentifierMappings.LastOrDefault(item =>
-                item.SourceObjectId == owner &&
-                item.ObjectType.Equals("Column", StringComparison.OrdinalIgnoreCase) &&
-                item.SourceName.Equals(name, StringComparison.OrdinalIgnoreCase))?.TargetName ?? name)).ToArray();
+        GetMappingLookup(conversion).MapChildNames(owner, sourceNames);
 
     private static bool ConstraintTypeMatches(ConstraintKind source, string target) =>
         source.ToString().Equals(target, StringComparison.OrdinalIgnoreCase);
