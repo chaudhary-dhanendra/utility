@@ -1,0 +1,59 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>BenchmarkDotNet</id>
+    <version>0.15.8</version>
+    <authors>.NET Foundation and contributors</authors>
+    <license type="expression">MIT</license>
+    <licenseUrl>https://licenses.nuget.org/MIT</licenseUrl>
+    <icon>package-icon.png</icon>
+    <projectUrl>https://github.com/dotnet/BenchmarkDotNet</projectUrl>
+    <description>Powerful .NET library for benchmarking</description>
+    <copyright>.NET Foundation and contributors</copyright>
+    <tags>benchmark benchmarking performance</tags>
+    <repository type="git" url="https://github.com/dotnet/BenchmarkDotNet" commit="1e8238ef6c08e18821edae83ac8d6b0a2bb1bb98" />
+    <dependencies>
+      <group targetFramework="net6.0">
+        <dependency id="BenchmarkDotNet.Annotations" version="0.15.8" exclude="Build,Analyzers" />
+        <dependency id="CommandLineParser" version="2.9.1" exclude="Build,Analyzers" />
+        <dependency id="Gee.External.Capstone" version="2.3.0" exclude="Build,Analyzers" />
+        <dependency id="Iced" version="1.21.0" exclude="Build,Analyzers" />
+        <dependency id="Microsoft.CodeAnalysis.CSharp" version="4.14.0" exclude="Build,Analyzers" />
+        <dependency id="Microsoft.Diagnostics.Runtime" version="3.1.512801" exclude="Build,Analyzers" />
+        <dependency id="Microsoft.Diagnostics.Tracing.TraceEvent" version="3.1.21" exclude="Analyzers" />
+        <dependency id="Microsoft.DotNet.PlatformAbstractions" version="3.1.6" exclude="Build,Analyzers" />
+        <dependency id="Perfolizer" version="[0.6.1]" exclude="Build,Analyzers" />
+        <dependency id="System.Management" version="9.0.5" exclude="Build,Analyzers" />
+      </group>
+      <group targetFramework="net8.0">
+        <dependency id="BenchmarkDotNet.Annotations" version="0.15.8" exclude="Build,Analyzers" />
+        <dependency id="CommandLineParser" version="2.9.1" exclude="Build,Analyzers" />
+        <dependency id="Gee.External.Capstone" version="2.3.0" exclude="Build,Analyzers" />
+        <dependency id="Iced" version="1.21.0" exclude="Build,Analyzers" />
+        <dependency id="Microsoft.CodeAnalysis.CSharp" version="4.14.0" exclude="Build,Analyzers" />
+        <dependency id="Microsoft.Diagnostics.Runtime" version="3.1.512801" exclude="Build,Analyzers" />
+        <dependency id="Microsoft.Diagnostics.Tracing.TraceEvent" version="3.1.21" exclude="Analyzers" />
+        <dependency id="Microsoft.DotNet.PlatformAbstractions" version="3.1.6" exclude="Build,Analyzers" />
+        <dependency id="Perfolizer" version="[0.6.1]" exclude="Build,Analyzers" />
+        <dependency id="System.Management" version="9.0.5" exclude="Build,Analyzers" />
+      </group>
+      <group targetFramework=".NETStandard2.0">
+        <dependency id="BenchmarkDotNet.Annotations" version="0.15.8" exclude="Build,Analyzers" />
+        <dependency id="CommandLineParser" version="2.9.1" exclude="Build,Analyzers" />
+        <dependency id="Gee.External.Capstone" version="2.3.0" exclude="Build,Analyzers" />
+        <dependency id="Iced" version="1.21.0" exclude="Build,Analyzers" />
+        <dependency id="Microsoft.CodeAnalysis.CSharp" version="4.14.0" exclude="Build,Analyzers" />
+        <dependency id="Microsoft.Diagnostics.Runtime" version="3.1.512801" exclude="Build,Analyzers" />
+        <dependency id="Microsoft.Diagnostics.Tracing.TraceEvent" version="3.1.21" exclude="Analyzers" />
+        <dependency id="Microsoft.DotNet.PlatformAbstractions" version="3.1.6" exclude="Build,Analyzers" />
+        <dependency id="Microsoft.Win32.Registry" version="5.0.0" exclude="Build,Analyzers" />
+        <dependency id="Perfolizer" version="[0.6.1]" exclude="Build,Analyzers" />
+        <dependency id="System.Management" version="9.0.5" exclude="Build,Analyzers" />
+        <dependency id="System.Numerics.Vectors" version="4.5.0" exclude="Build,Analyzers" />
+        <dependency id="System.Reflection.Emit" version="4.7.0" exclude="Build,Analyzers" />
+        <dependency id="System.Reflection.Emit.Lightweight" version="4.7.0" exclude="Build,Analyzers" />
+        <dependency id="System.Threading.Tasks.Extensions" version="4.6.3" exclude="Build,Analyzers" />
+      </group>
+    </dependencies>
+  </metadata>
+</package>

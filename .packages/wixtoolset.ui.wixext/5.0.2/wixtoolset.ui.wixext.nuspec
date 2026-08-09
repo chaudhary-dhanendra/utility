@@ -1,0 +1,15 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2011/08/nuspec.xsd">
+  <metadata>
+    <id>WixToolset.UI.wixext</id>
+    <version>5.0.2</version>
+    <title>WiX Toolset UI Extension</title>
+    <authors>WiX Toolset Team</authors>
+    <license type="expression">MS-RL</license>
+    <licenseUrl>https://licenses.nuget.org/MS-RL</licenseUrl>
+    <icon>wix.png</icon>
+    <description>WiX Toolset UI Extension</description>
+    <copyright>Copyright (c) .NET Foundation and contributors. All rights reserved.</copyright>
+    <repository type="git" url="https://github.com/wixtoolset/wix" commit="aa65968c419420d32e3e1b647aea0082f5ca5b78" />
+  </metadata>
+</package>

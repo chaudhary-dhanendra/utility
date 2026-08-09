@@ -8,6 +8,15 @@ namespace MigrationStudio.Tests.Desktop;
 public sealed class LiveValidationWorkflowTests
 {
     [Fact]
+    public void CompletedWithWarningsEnablesWizardCompletionAndNextNavigation()
+    {
+        Assert.Equal(
+            WizardStepState.CompletedWithWarnings,
+            MigrationWizardViewModel.SuccessfulConversionState(hasWarnings: true));
+        Assert.True(MigrationWizardViewModel.IsCompletedState(WizardStepState.CompletedWithWarnings));
+    }
+
+    [Fact]
     public async Task ValidationStartsWithSixtySevenExecutableNotRunArtifacts()
     {
         var artifacts = Enumerable.Range(1, 67)
@@ -156,6 +165,136 @@ public sealed class LiveValidationWorkflowTests
     }
 
     [Fact]
+    public async Task RuntimeBlockedProcedurePublishesWithWarningReconciliation()
+    {
+        var prerequisite = Artifact(1) with
+        {
+            TargetObjectId = new TargetObjectIdentifier("Procedure", "public", "p1"),
+            DeploymentPhase = DeploymentPhase.Procedures
+        };
+        var dependent = Artifact(2) with
+        {
+            TargetObjectId = new TargetObjectIdentifier("Procedure", "public", "p2"),
+            DeploymentPhase = DeploymentPhase.Procedures,
+            Dependencies = [prerequisite.SourceObjectId]
+        };
+        var result = await ExecuteAsync(
+            [prerequisite, dependent],
+            item => item.SourceObjectId == dependent.SourceObjectId
+                ? Blocked(item, prerequisite.SourceObjectId)
+                : Passed(item));
+
+        Assert.True(result.Reconciliation.CanPublish);
+        Assert.Equal(1, result.Reconciliation.NonFatalBlockedCount);
+        Assert.Equal(1, result.Reconciliation.RuntimeOnlyCount);
+        WorkspaceViewModel.EnsureAllDeployableArtifactsValidated(result.Run);
+    }
+
+    [Fact]
+    public async Task ManualReviewDependencyPublishesWithWarningReconciliation()
+    {
+        var manual = Artifact(1) with
+        {
+            TargetObjectId = new TargetObjectIdentifier("Procedure", "public", "manual_p"),
+            DeploymentPhase = DeploymentPhase.Procedures,
+            Classification = ConversionClassification.ManualConversion,
+            RequiresManualReview = true
+        };
+        var dependent = Artifact(2) with
+        {
+            TargetObjectId = new TargetObjectIdentifier("Procedure", "public", "dependent_p"),
+            DeploymentPhase = DeploymentPhase.Procedures,
+            Dependencies = [manual.SourceObjectId]
+        };
+        var result = await ExecuteAsync(
+            [manual, dependent],
+            item => item.SourceObjectId == manual.SourceObjectId
+                ? Manual(item)
+                : Blocked(item, manual.SourceObjectId));
+
+        Assert.True(result.Reconciliation.CanPublish);
+        Assert.Equal(1, result.Reconciliation.ManualReviewDependencyCount);
+    }
+
+    [Fact]
+    public async Task CascadingFalseBlockPublishesWhenHardPrerequisiteIsOrdered()
+    {
+        var table = Artifact(1);
+        var index = Artifact(2) with
+        {
+            TargetObjectId = new TargetObjectIdentifier("Index", "public", "ix_t1"),
+            DeploymentPhase = DeploymentPhase.Indexes,
+            Dependencies = [table.SourceObjectId]
+        };
+        var result = await ExecuteAsync(
+            [table, index],
+            item => item.SourceObjectId == index.SourceObjectId
+                ? Blocked(item, table.SourceObjectId)
+                : Passed(item));
+
+        Assert.True(result.Reconciliation.CanPublish);
+        Assert.Equal(1, result.Reconciliation.CascadingOrFalseBlockCount);
+    }
+
+    [Fact]
+    public async Task GenuineCreationDependencyIsRetainedAsNonfatalPlannedDeferral()
+    {
+        var function = Artifact(1) with
+        {
+            TargetObjectId = new TargetObjectIdentifier("Function", "public", "manual_f"),
+            DeploymentPhase = DeploymentPhase.Functions,
+            Classification = ConversionClassification.ManualConversion,
+            RequiresManualReview = true
+        };
+        var check = Artifact(2) with
+        {
+            TargetObjectId = new TargetObjectIdentifier("CheckConstraint", "public", "ck_t"),
+            DeploymentPhase = DeploymentPhase.CheckConstraints,
+            Dependencies = [function.SourceObjectId]
+        };
+        var result = await ExecuteAsync(
+            [function, check],
+            item => item.SourceObjectId == function.SourceObjectId
+                ? Manual(item)
+                : Blocked(item, function.SourceObjectId));
+
+        Assert.True(result.Reconciliation.CanPublish);
+        Assert.Equal(1, result.Reconciliation.DeferredByPlanCount);
+        Assert.Single(result.DeploymentPlan.DeferredArtifacts);
+    }
+
+    [Fact]
+    public async Task HardCyclePreventsPublication()
+    {
+        var first = Artifact(1);
+        var second = Artifact(2);
+        first = first with { Dependencies = [second.SourceObjectId] };
+        second = second with { Dependencies = [first.SourceObjectId] };
+
+        var result = await ExecuteAsync([first, second], Passed);
+
+        Assert.False(result.Reconciliation.CanPublish);
+        Assert.Equal(1, result.Reconciliation.HardCycleCount);
+        Assert.Throws<InvalidOperationException>(() =>
+            WorkspaceViewModel.EnsureAllDeployableArtifactsValidated(result.Run));
+    }
+
+    [Fact]
+    public async Task UnresolvedInternalHardDependencyPreventsPublication()
+    {
+        var artifact = Artifact(1) with
+        {
+            Dependencies = [InventoryObjectId.Create(
+                "missing", InventoryObjectType.Table, "public", "missing", 1)]
+        };
+
+        var result = await ExecuteAsync([artifact], Passed);
+
+        Assert.False(result.Reconciliation.CanPublish);
+        Assert.Equal(1, result.Reconciliation.UnresolvedInternalDependencyCount);
+    }
+
+    [Fact]
     public void ChangedSqlHashMakesPreviousValidationStale()
     {
         var original = Artifact(1);
@@ -263,6 +402,25 @@ public sealed class LiveValidationWorkflowTests
             ValidatedSqlHash = artifact.ContentHash,
             ValidatedAt = DateTimeOffset.UtcNow
         };
+
+    private static SqlValidationResult Manual(ConversionArtifact artifact) =>
+        new(true, false, null, "Manual review.", null)
+        {
+            Outcome = LiveSqlValidationOutcome.Manual,
+            Confidence = LiveSqlValidationConfidence.DisposableDatabase,
+            ValidatedSqlHash = artifact.ContentHash,
+            ValidatedAt = DateTimeOffset.UtcNow
+        };
+
+    private static Task<LiveValidationWorkflowResult> ExecuteAsync(
+        IReadOnlyList<ConversionArtifact> artifacts,
+        Func<ConversionArtifact, SqlValidationResult> resultFactory) =>
+        LiveValidationWorkflow.ExecuteAsync(
+            Run(artifacts),
+            artifacts,
+            new RecordingValidator(resultFactory),
+            new PostgreSqlValidationOptions("Host=not-opened"),
+            CancellationToken.None);
 
     private sealed class RecordingValidator(
         Func<ConversionArtifact, SqlValidationResult> resultFactory)

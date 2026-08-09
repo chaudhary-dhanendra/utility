@@ -1,0 +1,56 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>PDFsharp-MigraDoc</id>
+    <version>6.2.4</version>
+    <title>PDFsharp plus MigraDoc for Windows and Linux</title>
+    <authors>PDFsharp Team</authors>
+    <owners>empira Software GmbH</owners>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <license type="expression">MIT</license>
+    <licenseUrl>https://licenses.nuget.org/MIT</licenseUrl>
+    <icon>images\MigraDoc-128x128.png</icon>
+    <readme>README.md</readme>
+    <projectUrl>https://docs.pdfsharp.net/</projectUrl>
+    <description>MigraDoc is a .NET library that allows developers to create documents such as PDF and RTF using a high-level object model. It provides an intuitive API that simplifies the creation of documents, including text formatting, tables, images, and more. MigraDoc is widely used for generating reports, invoices, and other types of documents in various applications.
+This package does not depend on Windows and can be used on any .NET compatible platform including Linux and macOS.
+See https://docs.pdfsharp.net for details.</description>
+    <summary>Creating Documents on the Fly.</summary>
+    <releaseNotes>This is a version of PDFsharp and MigraDoc compatible with .NET 6 and higher.
+The package ‘PDFsharp-MigraDoc’ can be used on any platform including Windows and Linux. The Target Frameworks are ‘net8.0’, ‘net9.0’, ‘net10.0’, and ‘netstandard2.0’.
+The packages ‘PDFsharp-MigraDoc-GDI’ and ‘PDFsharp-MigraDoc-WPF’ can be used under Windows only. The Target Frameworks are ‘net8.0-windows’, ‘net9.0-windows’, ‘net10.0-windows’, and ‘net462’.
+See the project docs site for further information:
+https://docs.pdfsharp.net/link/readme-v6.2.html</releaseNotes>
+    <copyright>© 2026 empira</copyright>
+    <tags>MigraDoc PDFsharp PDF Document Generation</tags>
+    <repository type="git" url="https://github.com/empira/PDFsharp" branch="master" />
+    <dependencies>
+      <group targetFramework="net8.0">
+        <dependency id="Microsoft.Extensions.Logging.Abstractions" version="8.0.3" />
+        <dependency id="System.Security.Cryptography.Pkcs" version="8.0.1" />
+        <dependency id="PDFsharp" version="6.2.4" />
+      </group>
+      <group targetFramework="net9.0">
+        <dependency id="Microsoft.Extensions.Logging.Abstractions" version="8.0.3" />
+        <dependency id="System.Security.Cryptography.Pkcs" version="8.0.1" />
+        <dependency id="PDFsharp" version="6.2.4" />
+      </group>
+      <group targetFramework="net10.0">
+        <dependency id="Microsoft.Extensions.Logging.Abstractions" version="8.0.3" />
+        <dependency id="System.Security.Cryptography.Pkcs" version="8.0.1" />
+        <dependency id="PDFsharp" version="6.2.4" />
+      </group>
+      <group targetFramework=".NETStandard2.0">
+        <dependency id="Microsoft.Extensions.Logging.Abstractions" version="8.0.3" />
+        <dependency id="System.Security.Cryptography.Pkcs" version="8.0.1" />
+        <dependency id="PDFsharp" version="6.2.4" />
+      </group>
+    </dependencies>
+    <frameworkReferences>
+      <group targetFramework="net8.0" />
+      <group targetFramework="net9.0" />
+      <group targetFramework="net10.0" />
+      <group targetFramework=".NETStandard2.0" />
+    </frameworkReferences>
+  </metadata>
+</package>

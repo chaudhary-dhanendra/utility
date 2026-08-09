@@ -1,5 +1,7 @@
 using MigrationStudio.Application.Conversion;
+using MigrationStudio.Deployment;
 using MigrationStudio.Domain.Conversion;
+using MigrationStudio.Domain.Deployment;
 
 namespace MigrationStudio.Desktop.ViewModels;
 
@@ -14,7 +16,9 @@ internal sealed record LiveValidationWorkflowResult(
     int FailedCount,
     int BlockedCount,
     int NotRunCount,
-    int ManualReviewCount);
+    int ManualReviewCount,
+    DeploymentPlan DeploymentPlan,
+    BlockedDependencyReconciliation Reconciliation);
 
 internal static class LiveValidationWorkflow
 {
@@ -61,6 +65,8 @@ internal static class LiveValidationWorkflow
             artifacts,
             resultsByIdentity);
         var run = current with { Artifacts = updated };
+        var planning = DeploymentPublicationReconciler.Reconcile(run);
+        run = run with { PublicationReconciliation = planning.Reconciliation };
 
         return new LiveValidationWorkflowResult(
             run,
@@ -76,6 +82,8 @@ internal static class LiveValidationWorkflow
             updated.Count(item => item.Validation.Outcome == LiveSqlValidationOutcome.NotRun),
             updated.Count(item =>
                 item.Validation.Outcome is LiveSqlValidationOutcome.Manual or
-                    LiveSqlValidationOutcome.Unsupported));
+                    LiveSqlValidationOutcome.Unsupported),
+            planning.Plan,
+            planning.Reconciliation);
     }
 }

@@ -7,6 +7,75 @@ using NpgsqlTypes;
 
 namespace MigrationStudio.Infrastructure.DataMigration;
 
+
+internal static class PostgreSqlWritableColumnResolver
+{
+    public static async Task<(ColumnMapping[] Columns, int[] SourceIndexes)> ResolveAsync(
+        NpgsqlConnection connection,
+        TableLoadPlan table,
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+            SELECT a.attname
+            FROM pg_catalog.pg_attribute a
+            JOIN pg_catalog.pg_class c
+              ON c.oid = a.attrelid
+            JOIN pg_catalog.pg_namespace n
+              ON n.oid = c.relnamespace
+            WHERE n.nspname = @schema
+              AND c.relname = @table
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+              AND a.attgenerated <> '';
+            """;
+
+        await using var command = new NpgsqlCommand(sql, connection);
+        command.Parameters.AddWithValue("schema", table.TargetSchema);
+        command.Parameters.AddWithValue("table", table.TargetTable);
+
+        var generatedColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        await using (var reader = await command.ExecuteReaderAsync(cancellationToken)
+                         .ConfigureAwait(false))
+        {
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                generatedColumns.Add(reader.GetString(0));
+            }
+        }
+
+        var included = table.Columns
+            .Where(item => item.IsIncluded)
+            .ToArray();
+
+        var selected = included
+            .Select((column, index) => new
+            {
+                Column = column,
+                SourceIndex = index
+            })
+            .Where(item => !generatedColumns.Contains(item.Column.TargetName))
+            .ToArray();
+
+        var columns = selected
+            .Select(item => item.Column)
+            .ToArray();
+
+        var sourceIndexes = selected
+            .Select(item => item.SourceIndex)
+            .ToArray();
+
+        if (columns.Length == 0)
+        {
+            throw new InvalidOperationException(
+                $"No writable target columns remain for {table.TargetQualifiedName}. " +
+                "All included target columns are PostgreSQL generated columns.");
+        }
+
+        return (columns, sourceIndexes);
+    }
+}
+
 public sealed class PostgreSqlBinaryCopyStrategy : IDataTransferStrategy
 {
     public DataTransferStrategy Strategy => DataTransferStrategy.PostgreSqlBinaryCopy;
@@ -21,10 +90,7 @@ public sealed class PostgreSqlBinaryCopyStrategy : IDataTransferStrategy
         CancellationToken cancellationToken)
     {
         var started = System.Diagnostics.Stopwatch.StartNew();
-        var columns = context.Table.Columns.Where(item => item.IsIncluded).ToArray();
-        var sql = $"COPY {Quote(context.Table.TargetSchema)}.{Quote(context.Table.TargetTable)} " +
-            $"({string.Join(", ", columns.Select(item => Quote(item.TargetName)))}) FROM STDIN (FORMAT BINARY)";
-        ObserveInstant(context, StreamingExecutionStage.GenerateWritePlan, copySql: sql);
+
         await using var connection = new NpgsqlConnection(context.TargetConnectionString);
         await ObserveAsync(
             context,
@@ -32,6 +98,17 @@ public sealed class PostgreSqlBinaryCopyStrategy : IDataTransferStrategy
             "NpgsqlConnection",
             null,
             () => connection.OpenAsync(cancellationToken)).ConfigureAwait(false);
+
+        var (columns, sourceIndexes) =
+            await PostgreSqlWritableColumnResolver.ResolveAsync(
+                connection,
+                context.Table,
+                cancellationToken).ConfigureAwait(false);
+
+        var sql = $"COPY {Quote(context.Table.TargetSchema)}.{Quote(context.Table.TargetTable)} " +
+            $"({string.Join(", ", columns.Select(item => Quote(item.TargetName)))}) FROM STDIN (FORMAT BINARY)";
+
+        ObserveInstant(context, StreamingExecutionStage.GenerateWritePlan, copySql: sql);
         ObserveInstant(context, StreamingExecutionStage.BeginPostgreSqlTransaction, writer: "COPY transaction");
         ObserveInstant(context, StreamingExecutionStage.CreatePostgreSqlWriter, writer: nameof(NpgsqlBinaryImporter));
         NpgsqlBinaryImporter importer;
@@ -56,9 +133,9 @@ public sealed class PostgreSqlBinaryCopyStrategy : IDataTransferStrategy
             try
             {
                 await importer.StartRowAsync(cancellationToken).ConfigureAwait(false);
-                for (var index = 0; index < row.Values.Count; index++)
+                for (var index = 0; index < columns.Length; index++)
                 {
-                    var value = row.Values[index];
+                    var value = row.Values[sourceIndexes[index]];
                     if (value is null)
                     {
                         await importer.WriteNullAsync(cancellationToken).ConfigureAwait(false);
@@ -177,16 +254,24 @@ public sealed class PostgreSqlTextCopyStrategy(ICanonicalValueFormatter formatte
         CancellationToken cancellationToken)
     {
         var started = System.Diagnostics.Stopwatch.StartNew();
-        var columns = context.Table.Columns.Where(item => item.IsIncluded).ToArray();
-        var sql = $"COPY {Quote(context.Table.TargetSchema)}.{Quote(context.Table.TargetTable)} " +
-            $"({string.Join(", ", columns.Select(item => Quote(item.TargetName)))}) " +
-            "FROM STDIN (FORMAT TEXT, DELIMITER E'\\t', NULL '\\N')";
-        PostgreSqlBinaryCopyStrategy.ObserveInstant(
-            context, StreamingExecutionStage.GenerateWritePlan, copySql: sql);
+
         await using var connection = new NpgsqlConnection(context.TargetConnectionString);
         await PostgreSqlBinaryCopyStrategy.ObserveAsync(
             context, StreamingExecutionStage.OpenPostgreSqlConnection, "NpgsqlConnection", null,
             () => connection.OpenAsync(cancellationToken)).ConfigureAwait(false);
+
+        var (columns, sourceIndexes) =
+            await PostgreSqlWritableColumnResolver.ResolveAsync(
+                connection,
+                context.Table,
+                cancellationToken).ConfigureAwait(false);
+
+        var sql = $"COPY {Quote(context.Table.TargetSchema)}.{Quote(context.Table.TargetTable)} " +
+            $"({string.Join(", ", columns.Select(item => Quote(item.TargetName)))}) " +
+            "FROM STDIN (FORMAT TEXT, DELIMITER E'\\t', NULL '\\N')";
+
+        PostgreSqlBinaryCopyStrategy.ObserveInstant(
+            context, StreamingExecutionStage.GenerateWritePlan, copySql: sql);
         PostgreSqlBinaryCopyStrategy.ObserveInstant(
             context, StreamingExecutionStage.BeginPostgreSqlTransaction, "COPY transaction");
         PostgreSqlBinaryCopyStrategy.ObserveInstant(
@@ -211,8 +296,13 @@ public sealed class PostgreSqlTextCopyStrategy(ICanonicalValueFormatter formatte
             cancellationToken.ThrowIfCancellationRequested();
             var line = string.Join(
                 '\t',
-                row.Values.Select((value, index) =>
-                    value is null ? "\\N" : Escape(ToInvariantText(value, columns[index].TransportKind))));
+                columns.Select((column, index) =>
+                {
+                    var value = row.Values[sourceIndexes[index]];
+                    return value is null
+                        ? "\\N"
+                        : Escape(ToInvariantText(value, column.TransportKind));
+                }));
             var firstWrite = first
                 ? PostgreSqlBinaryCopyStrategy.Start(
                     context, StreamingExecutionStage.WriteFirstRow, nameof(StreamWriter), sql)
@@ -269,18 +359,26 @@ public sealed class PostgreSqlBatchInsertStrategy : IDataTransferStrategy
         CancellationToken cancellationToken)
     {
         var started = System.Diagnostics.Stopwatch.StartNew();
-        var columns = context.Table.Columns.Where(item => item.IsIncluded).ToArray();
+
+        await using var connection = new NpgsqlConnection(context.TargetConnectionString);
+        await PostgreSqlBinaryCopyStrategy.ObserveAsync(
+            context, StreamingExecutionStage.OpenPostgreSqlConnection, "NpgsqlConnection", null,
+            () => connection.OpenAsync(cancellationToken)).ConfigureAwait(false);
+
+        var (columns, sourceIndexes) =
+            await PostgreSqlWritableColumnResolver.ResolveAsync(
+                connection,
+                context.Table,
+                cancellationToken).ConfigureAwait(false);
+
         var parameterNames = columns.Select((_, index) => $"@p{index}").ToArray();
         var sql = $"INSERT INTO {Quote(context.Table.TargetSchema)}.{Quote(context.Table.TargetTable)} " +
             $"({string.Join(", ", columns.Select(item => Quote(item.TargetName)))}) " +
             $"VALUES ({string.Join(", ", parameterNames)})" +
             CreateUpsertClause(context.Table, columns);
+
         PostgreSqlBinaryCopyStrategy.ObserveInstant(
             context, StreamingExecutionStage.GenerateWritePlan, insertSql: sql);
-        await using var connection = new NpgsqlConnection(context.TargetConnectionString);
-        await PostgreSqlBinaryCopyStrategy.ObserveAsync(
-            context, StreamingExecutionStage.OpenPostgreSqlConnection, "NpgsqlConnection", null,
-            () => connection.OpenAsync(cancellationToken)).ConfigureAwait(false);
         NpgsqlTransaction transaction;
         var begin = PostgreSqlBinaryCopyStrategy.Start(
             context, StreamingExecutionStage.BeginPostgreSqlTransaction, nameof(NpgsqlTransaction),
@@ -305,9 +403,10 @@ public sealed class PostgreSqlBatchInsertStrategy : IDataTransferStrategy
         foreach (var row in rows)
         {
             var command = new NpgsqlBatchCommand(sql);
-            for (var index = 0; index < row.Values.Count; index++)
+            for (var index = 0; index < columns.Length; index++)
             {
-                command.Parameters.AddWithValue(parameterNames[index], row.Values[index] ?? DBNull.Value);
+                var value = row.Values[sourceIndexes[index]];
+                command.Parameters.AddWithValue(parameterNames[index], value ?? DBNull.Value);
             }
 
             batch.BatchCommands.Add(command);

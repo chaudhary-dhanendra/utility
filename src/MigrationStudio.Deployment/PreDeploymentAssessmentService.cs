@@ -160,7 +160,7 @@ public sealed class PreDeploymentAssessmentService(
             .Where(item => !artifactSourceIds.Contains(item))
             .ToArray();
 
-       
+
         if (missingMappedObjects.Length > 0)
         {
             foreach (var id in missingMappedObjects)
@@ -278,20 +278,40 @@ public sealed class PreDeploymentAssessmentService(
             .Where(item => !item.RequiresManualReview &&
                 item.Classification != Domain.Inventory.ConversionClassification.Unsupported)
             .ToArray();
+        var reconciledDecisions = GetReconciledDecisions(manifest);
+
         if (options.RequireLivePostgreSqlValidation)
         {
-            var missingLiveValidation = deployableSelectedArtifacts.Where(item =>
-                    item.LiveValidation.Outcome != LiveSqlValidationOutcome.Passed ||
-                    !item.LiveValidation.WasLiveValidated ||
-                    !item.LiveValidation.IsStructurallyValid)
+            var missingLiveValidation = deployableSelectedArtifacts
+                .Where(item =>
+                    !HasSuccessfulCurrentLiveValidation(item) &&
+                    !HasAcceptedNonFatalValidationBlock(item, reconciledDecisions))
                 .ToArray();
             if (missingLiveValidation.Length > 0)
             {
                 findings.Add(new DeploymentFinding(
                     "VALIDATION.LIVE_REQUIRED",
                     DeploymentFindingSeverity.Critical,
-                    $"{missingLiveValidation.Length:N0} selected executable artifacts have not passed live PostgreSQL validation. " +
-                    "Run live validation and export a fresh package before production deployment."));
+                    $"{missingLiveValidation.Length:N0} selected executable artifacts have not passed " +
+                    "live PostgreSQL validation and are not covered by an accepted nonfatal " +
+                    "dependency-reconciliation decision. Run live validation and export a fresh package " +
+                    "before production deployment."));
+            }
+
+            var acceptedNonFatalBlocks = deployableSelectedArtifacts
+                .Where(item =>
+                    !HasSuccessfulCurrentLiveValidation(item) &&
+                    HasAcceptedNonFatalValidationBlock(item, reconciledDecisions))
+                .ToArray();
+            if (acceptedNonFatalBlocks.Length > 0)
+            {
+                findings.Add(new DeploymentFinding(
+                    "VALIDATION.NONFATAL_DEPENDENCY_RECONCILED",
+                    DeploymentFindingSeverity.Warning,
+                    $"{acceptedNonFatalBlocks.Length:N0} executable artifacts were structurally valid but " +
+                    "were not executed during isolated validation because their dependencies require " +
+                    "manual review or were otherwise classified as nonfatal. They will be deployed using " +
+                    "the verified dependency-aware deployment plan."));
             }
         }
 
@@ -312,17 +332,33 @@ public sealed class PreDeploymentAssessmentService(
             if (artifact.RequiresManualReview && IsSelected(artifact, options))
             {
                 var isRequiredDependency = requiredByDeployableArtifact.Contains(artifact.SourceObjectId);
+                var acceptedNonFatalDependency = isRequiredDependency &&
+                    IsAcceptedManualReviewDependency(
+                        artifact.SourceObjectId,
+                        deployableSelectedArtifacts,
+                        reconciledDecisions);
+
                 findings.Add(new DeploymentFinding(
-                    isRequiredDependency ? "MANUAL.REQUIRED_DEPENDENCY" : "MANUAL.REVIEW",
                     isRequiredDependency
+                        ? acceptedNonFatalDependency
+                            ? "MANUAL.RECONCILED_DEPENDENCY"
+                            : "MANUAL.REQUIRED_DEPENDENCY"
+                        : "MANUAL.REVIEW",
+                    isRequiredDependency && !acceptedNonFatalDependency
                         ? DeploymentFindingSeverity.Critical
                         : DeploymentFindingSeverity.Warning,
                     isRequiredDependency
-                        ? $"{artifact.TargetSchema}.{artifact.TargetName} requires manual review and is a dependency of an executable artifact."
-                        : $"{artifact.TargetSchema}.{artifact.TargetName} requires manual review and will be reported but not executed.",
+                        ? acceptedNonFatalDependency
+                            ? $"{artifact.TargetSchema}.{artifact.TargetName} requires manual review and is " +
+                              "referenced by executable artifacts, but package reconciliation classified " +
+                              "the dependency as nonfatal."
+                            : $"{artifact.TargetSchema}.{artifact.TargetName} requires manual review and is a " +
+                              "dependency of an executable artifact."
+                        : $"{artifact.TargetSchema}.{artifact.TargetName} requires manual review and will be " +
+                          "reported but not executed.",
                     artifact.Phase,
                     artifact.SourceObjectId,
-                    !isRequiredDependency));
+                    !isRequiredDependency || acceptedNonFatalDependency));
             }
 
             if (artifact.Classification == Domain.Inventory.ConversionClassification.Unsupported &&
@@ -357,6 +393,65 @@ public sealed class PreDeploymentAssessmentService(
                     artifact.SourceObjectId));
             }
         }
+    }
+
+    private static Dictionary<InventoryObjectId, BlockedDependencyArtifactDecision>
+       GetReconciledDecisions(MigrationPackageManifest manifest)
+    {
+        return manifest.BlockedDependencyReconciliation?
+            .ArtifactDecisions
+            .GroupBy(item => item.SourceObjectId)
+            .ToDictionary(group => group.Key, group => group.Last())
+            ?? new Dictionary<InventoryObjectId, BlockedDependencyArtifactDecision>();
+    }
+    private static bool HasSuccessfulCurrentLiveValidation(
+        PackageArtifactManifest artifact)
+    {
+        return artifact.LiveValidation.Outcome == LiveSqlValidationOutcome.Passed &&
+               artifact.LiveValidation.WasLiveValidated &&
+               artifact.LiveValidation.IsStructurallyValid &&
+               string.Equals(
+                   artifact.LiveValidation.ValidatedSqlHash,
+                   artifact.SqlSha256,
+                   StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool HasAcceptedNonFatalValidationBlock(
+        PackageArtifactManifest artifact,
+        Dictionary<InventoryObjectId, BlockedDependencyArtifactDecision> decisions)
+    {
+        return artifact.LiveValidation.Outcome == LiveSqlValidationOutcome.BlockedByDependency &&
+               artifact.LiveValidation.IsStructurallyValid &&
+               string.Equals(
+                   artifact.LiveValidation.ValidatedSqlHash,
+                   artifact.SqlSha256,
+                   StringComparison.OrdinalIgnoreCase) &&
+               decisions.TryGetValue(artifact.SourceObjectId, out var decision) &&
+               !decision.IsFatal &&
+               decision.ReconciledClassification is
+                   ReconciledBlockedClassification.RuntimeOnly or
+                   ReconciledBlockedClassification.Optional or
+                   ReconciledBlockedClassification.ManualReviewDependency or
+                   ReconciledBlockedClassification.ExternalDependency or
+                   ReconciledBlockedClassification.FalseOrCascadingBlock or
+                   ReconciledBlockedClassification.DeferredByDeploymentPlan;
+    }
+
+    private static bool IsAcceptedManualReviewDependency(
+        InventoryObjectId manualObjectId,
+        IReadOnlyList<PackageArtifactManifest> deployableArtifacts,
+        Dictionary<InventoryObjectId, BlockedDependencyArtifactDecision> decisions)
+    {
+        var dependents = deployableArtifacts
+            .Where(item => item.Dependencies.Contains(manualObjectId))
+            .ToArray();
+
+        return dependents.Length > 0 &&
+               dependents.All(item =>
+                   decisions.TryGetValue(item.SourceObjectId, out var decision) &&
+                   !decision.IsFatal &&
+                   decision.ReconciledClassification ==
+                       ReconciledBlockedClassification.ManualReviewDependency);
     }
 
     private static bool IsArtifactLevelMapping(IdentifierMappingEntry mapping) =>

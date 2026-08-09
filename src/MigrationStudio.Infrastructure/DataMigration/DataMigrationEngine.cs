@@ -29,6 +29,24 @@ public sealed class DataMigrationEngine(
     ISensitiveDataRedactor? sensitiveDataRedactor = null,
     ILogger<DataMigrationEngine>? logger = null) : IDataMigrationEngine
 {
+
+    private readonly ILogger<DataMigrationEngine> _logger =
+    logger ?? NullLogger<DataMigrationEngine>.Instance;
+
+    private static readonly Action<ILogger, string, long, long?, string, string?, string, Exception?>
+    LogMigrationFailure =
+        LoggerMessage.Define<
+            string,
+            long,
+            long?,
+            string,
+            string?,
+            string>(
+            LogLevel.Error,
+            new EventId(1001, nameof(LogMigrationFailure)),
+            "Data migration failed for table {Table}; Batch={Batch}; Row={Row}; Category={Category}; SqlState={SqlState}; ProviderMessage={ProviderMessage}");
+
+
     public Task<DataMigrationResult> ExecuteAsync(
         DataMigrationRequest request,
         IProgress<DataMigrationProgress>? progress,
@@ -58,10 +76,10 @@ public sealed class DataMigrationEngine(
     {
         var plan = planner.CreatePlan(request);
         var stageObserver = new StreamingStageObserver(
-            plan.RunId,
-            progress,
-            sensitiveDataRedactor ?? PassThroughRedactor.Instance,
-            logger ?? NullLogger<DataMigrationEngine>.Instance);
+    plan.RunId,
+    progress,
+    sensitiveDataRedactor ?? PassThroughRedactor.Instance,
+    _logger);
         var loadPlanStage = stageObserver.Start(StreamingExecutionStage.LoadMigrationPlan);
         stageObserver.Succeed(loadPlanStage);
         session.SetPlan(plan);
@@ -244,7 +262,7 @@ public sealed class DataMigrationEngine(
                     warnings);
                 cancelled = cancelled with { StreamingStages = stageObserver.Snapshot() };
                 session.SetResult(cancelled);
-        return cancelled;
+                return cancelled;
             }
         }
 
@@ -992,6 +1010,7 @@ public sealed class DataMigrationEngine(
             DataConsistencyMode.DatabaseSnapshotConfiguredExternally or
             DataConsistencyMode.SourceQuiesced => IsolationLevel.Snapshot,
             _ => IsolationLevel.ReadCommitted
+
         };
         try
         {
@@ -1113,6 +1132,7 @@ public sealed class DataMigrationEngine(
             : MigrationRunState.Completed;
     }
 
+
     private MigrationFailure SafeFailure(
         TableLoadPlan table,
         long batch,
@@ -1121,12 +1141,40 @@ public sealed class DataMigrationEngine(
         int retry,
         FailureDisposition disposition)
     {
-        var sqlState = exception switch
+        ArgumentNullException.ThrowIfNull(exception);
+
+        var providerException = GetRelevantDatabaseException(exception);
+        var sqlState = providerException switch
         {
-            PostgresException postgres => postgres.SqlState,
+            PostgresException postgresException => postgresException.SqlState,
+            SqlException sqlException => sqlException.Number.ToString(CultureInfo.InvariantCulture),
             _ => null
         };
-        var category = transientErrors.Classify(exception);
+
+        var category = transientErrors.Classify(providerException);
+        var originalMessage = providerException switch
+        {
+            PostgresException postgresException => BuildPostgreSqlError(postgresException),
+            SqlException sqlException => BuildSqlServerError(sqlException),
+            NpgsqlException npgsqlException =>
+                $"NpgsqlException: {npgsqlException.Message}",
+            _ => BuildExceptionChainMessage(exception)
+        };
+
+        var storedMessage = sensitiveDataRedactor is null
+            ? originalMessage
+            : sensitiveDataRedactor.Redact(originalMessage);
+
+        LogMigrationFailure(
+     _logger,
+     table.SourceQualifiedName,
+     batch,
+     row,
+     category.ToString(),
+     sqlState,
+     storedMessage,
+     exception);
+
         return new MigrationFailure(
             table.SourceQualifiedName,
             batch,
@@ -1136,10 +1184,128 @@ public sealed class DataMigrationEngine(
             null,
             null,
             sqlState,
-            $"A {category} error occurred while transferring the row. Values and provider details were redacted.",
+            storedMessage,
             retry,
             category,
             disposition);
+    }
+
+    private static Exception GetRelevantDatabaseException(Exception exception)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+
+        Exception? current = exception;
+        Exception deepest = exception;
+        NpgsqlException? npgsqlException = null;
+
+        while (current is not null)
+        {
+            deepest = current;
+
+            if (current is PostgresException or SqlException)
+            {
+                return current;
+            }
+
+            if (current is NpgsqlException candidate)
+            {
+                npgsqlException = candidate;
+            }
+
+            current = current.InnerException;
+        }
+
+        return npgsqlException ?? deepest;
+    }
+
+    private static string BuildPostgreSqlError(PostgresException exception)
+    {
+        var parts = new List<string>
+        {
+            $"PostgreSQL error {exception.SqlState}: {exception.MessageText}"
+        };
+
+        if (!string.IsNullOrWhiteSpace(exception.Detail))
+        {
+            parts.Add($"Detail: {exception.Detail}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(exception.Hint))
+        {
+            parts.Add($"Hint: {exception.Hint}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(exception.Where))
+        {
+            parts.Add($"Where: {exception.Where}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(exception.SchemaName))
+        {
+            parts.Add($"Schema: {exception.SchemaName}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(exception.TableName))
+        {
+            parts.Add($"Table: {exception.TableName}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(exception.ColumnName))
+        {
+            parts.Add($"Column: {exception.ColumnName}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(exception.ConstraintName))
+        {
+            parts.Add($"Constraint: {exception.ConstraintName}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(exception.DataTypeName))
+        {
+            parts.Add($"Data type: {exception.DataTypeName}");
+        }
+
+        if (exception.Position > 0)
+        {
+            parts.Add($"Position: {exception.Position.ToString(CultureInfo.InvariantCulture)}");
+        }
+
+        return string.Join(" | ", parts);
+    }
+
+    private static string BuildSqlServerError(SqlException exception)
+    {
+        var errors = exception.Errors
+            .Cast<SqlError>()
+            .Select(error =>
+                $"SQL Server error {error.Number}, state {error.State}, " +
+                $"severity {error.Class}, procedure {error.Procedure ?? "(none)"}, " +
+                $"line {error.LineNumber}: {error.Message}")
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        return errors.Length == 0
+            ? $"SqlException: {exception.Message}"
+            : string.Join(" | ", errors);
+    }
+
+    private static string BuildExceptionChainMessage(Exception exception)
+    {
+        var messages = new List<string>();
+        Exception? current = exception;
+
+        while (current is not null)
+        {
+            var message = $"{current.GetType().Name}: {current.Message}";
+            if (!messages.Contains(message, StringComparer.Ordinal))
+            {
+                messages.Add(message);
+            }
+
+            current = current.InnerException;
+        }
+
+        return string.Join(" | Inner: ", messages);
     }
 
     private static void Report(

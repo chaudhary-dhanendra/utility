@@ -65,14 +65,22 @@ public sealed class CanonicalValueFormatter : ICanonicalValueFormatter
     }
 
     private static DateTime AsDateTime(object value) =>
-        value is DateTime dateTime
-            ? dateTime
-            : Convert.ToDateTime(value, CultureInfo.InvariantCulture);
+        value switch
+        {
+            DateTime dateTime => dateTime,
+            DateOnly dateOnly => dateOnly.ToDateTime(TimeOnly.MinValue),
+            _ => Convert.ToDateTime(value, CultureInfo.InvariantCulture)
+        };
 
     private static TimeSpan AsTimeSpan(object value) =>
-        value is TimeSpan timeSpan
-            ? timeSpan
-            : TimeSpan.Parse(Convert.ToString(value, CultureInfo.InvariantCulture)!, CultureInfo.InvariantCulture);
+        value switch
+        {
+            TimeSpan timeSpan => timeSpan,
+            TimeOnly timeOnly => timeOnly.ToTimeSpan(),
+            _ => TimeSpan.Parse(
+                Convert.ToString(value, CultureInfo.InvariantCulture)!,
+                CultureInfo.InvariantCulture)
+        };
 
     private static DateTimeOffset AsDateTimeOffset(object value) =>
         value is DateTimeOffset dateTimeOffset

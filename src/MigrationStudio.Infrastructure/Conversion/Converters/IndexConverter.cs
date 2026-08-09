@@ -76,13 +76,24 @@ public sealed class IndexConverter : IObjectConverter<InventoryObject, string>
                 $"-- Index {name} on {targetTable.QualifiedName} has no key columns and was not emitted.",
                 "empty index key list"));
         }
+        const int maximumPostgreSqlIndexColumns = 32;
+        if (keyColumns.Length > maximumPostgreSqlIndexColumns)
+        {
+            return Task.FromResult(ConversionRuleSupport.Manual(
+                source,
+                $"The index has {keyColumns.Length} key columns, exceeding PostgreSQL's {maximumPostgreSqlIndexColumns}-column limit; key columns cannot be dropped safely.",
+                $"-- Manual index redesign required for {name} on {targetTable.QualifiedName}.",
+                "oversized index key list"));
+        }
         var keys = string.Join(
             ", ",
             keyColumns.Select(item =>
                 $"{context.Identifiers.MapChildIdentifier(table.Id, "column", table.SourceSchema, item.Name)}{(item.IsDescending ? " DESC" : string.Empty)}"));
-        var included = index.Columns.Where(item => item.IsIncluded)
+        var allIncluded = index.Columns.Where(item => item.IsIncluded)
             .Select(item => context.Identifiers.MapChildIdentifier(table.Id, "column", table.SourceSchema, item.Name))
             .ToArray();
+        var includeCapacity = Math.Max(0, maximumPostgreSqlIndexColumns - keyColumns.Length);
+        var included = allIncluded.Take(includeCapacity).ToArray();
         var sql = new StringBuilder("CREATE ")
             .Append(index.IsUnique ? "UNIQUE " : string.Empty)
             .Append("INDEX ").Append(name)
@@ -95,6 +106,17 @@ public sealed class IndexConverter : IObjectConverter<InventoryObject, string>
 
         var findings = new List<InventoryFinding>();
         var classification = ConversionClassification.Automatic;
+        if (allIncluded.Length > included.Length)
+        {
+            classification = ConversionClassification.AutomaticWithWarning;
+            findings.Add(ConversionRuleSupport.Finding(
+                source,
+                "INDEX.INCLUDE_COLUMNS_OMITTED",
+                FindingSeverity.Warning,
+                $"PostgreSQL permits at most {maximumPostgreSqlIndexColumns} index columns; " +
+                $"{allIncluded.Length - included.Length} trailing INCLUDE column(s) were omitted: " +
+                string.Join(", ", allIncluded.Skip(included.Length))));
+        }
         if (index.IsFiltered && !string.IsNullOrWhiteSpace(index.FilterDefinition))
         {
             var translated = context.Expressions.Translate(
@@ -131,7 +153,7 @@ public sealed class IndexConverter : IObjectConverter<InventoryObject, string>
             }
             sql.Append(" WHERE ").Append(translated.Sql);
             findings.AddRange(translated.Findings);
-            classification = translated.Classification;
+            classification = ConversionRuleSupport.Worst(classification, translated.Classification);
         }
         sql.Append(';');
 

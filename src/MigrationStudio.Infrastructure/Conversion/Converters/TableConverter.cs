@@ -62,6 +62,10 @@ public sealed partial class TableConverter(
             item => item.Name,
             item => context.TypeMappings.Map(item, source, context.Options).TargetType,
             StringComparer.OrdinalIgnoreCase);
+        var routineSignatures = columns.Any(item => item.IsComputed)
+            ? BuildTargetRoutineSignatures(context)
+            : new Dictionary<string, TargetRoutineSignature>(StringComparer.OrdinalIgnoreCase);
+        var compatibilityAssignments = new List<ComputedCompatibilityAssignment>();
 
         foreach (var column in columns)
         {
@@ -98,11 +102,15 @@ public sealed partial class TableConverter(
                         TargetColumnNames = columnNames,
                         TargetObjectNames = context.TargetObjectNames,
                         TargetColumnTypes = targetColumnTypes,
+                        TargetRoutineSignatures = routineSignatures,
                         ExpectedTargetType = mapping.TargetType
                     });
                 findings.AddRange(translated.Findings);
                 extensions.UnionWith(translated.RequiredExtensions);
-                if (translated.IsImmutable &&
+                if (column.IsComputedDeterministic != false &&
+                    translated.IsImmutable &&
+                    !ContainsNonImmutablePostgreSqlExpression(translated.Sql) &&
+                    !ContainsTargetRoutineCall(translated.Sql, routineSignatures) &&
                     translated.Classification is ConversionClassification.Automatic or
                         ConversionClassification.AutomaticWithWarning)
                 {
@@ -117,14 +125,32 @@ public sealed partial class TableConverter(
                 }
                 else
                 {
+                    var compatibilitySql = translated.Sql;
+                    if (!string.IsNullOrWhiteSpace(compatibilitySql) &&
+                        translated.UnsupportedFunctions.All(item =>
+                            item.Equals("RAND", StringComparison.OrdinalIgnoreCase) ||
+                            item.Equals("RAND(seed)", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        compatibilityAssignments.Add(new ComputedCompatibilityAssignment(
+                            name,
+                            compatibilitySql,
+                            translated.ReferencedColumns
+                                .Concat(FindSourceReferencedColumns(column.ComputedDefinition, columnNames.Keys))
+                                .Distinct(StringComparer.OrdinalIgnoreCase)
+                                .ToArray()));
+                    }
                     classification = ConversionRuleSupport.Worst(
                         classification,
                         ConversionClassification.AutomaticWithWarning);
                     findings.Add(ConversionRuleSupport.Finding(
                         source,
-                        "COMPUTED.DATA_MIGRATION",
+                        compatibilityAssignments.Any(item => item.TargetColumn == name)
+                            ? "COMPUTED.TRIGGER_COMPATIBILITY"
+                            : "COMPUTED.DATA_MIGRATION",
                         FindingSeverity.Warning,
-                        $"Computed column '{column.Name}' is emitted as an ordinary nullable column and must be populated during data migration.",
+                        compatibilityAssignments.Any(item => item.TargetColumn == name)
+                            ? $"Computed column '{column.Name}' uses a BEFORE INSERT/relevant-column UPDATE compatibility trigger because PostgreSQL generated columns require immutable expressions; like SQL Server computed columns, an explicitly supplied value is overwritten."
+                            : $"Computed column '{column.Name}' is emitted as an ordinary nullable column and must be populated during data migration.",
                         column.ComputedDefinition));
                 }
             }
@@ -170,6 +196,17 @@ public sealed partial class TableConverter(
         sql.AppendLine(string.Join($",{Environment.NewLine}", definitions))
             .AppendLine(");");
 
+        if (compatibilityAssignments.Count > 0)
+        {
+            AppendComputedCompatibilityTrigger(
+                sql,
+                source,
+                target,
+                compatibilityAssignments,
+                columnNames,
+                context.Identifiers);
+        }
+
         if (table.Kind != TableKind.Ordinary)
         {
             findings.Add(ConversionRuleSupport.Finding(
@@ -197,6 +234,224 @@ public sealed partial class TableConverter(
             classification,
             classification == ConversionClassification.Automatic ? 1m : 0.75m));
     }
+
+    private static bool ContainsNonImmutablePostgreSqlExpression(string expression)
+    {
+        var nonImmutable = new HashSet<string>(
+            ["random", "now", "clock_timestamp", "statement_timestamp", "transaction_timestamp", "timeofday"],
+            StringComparer.OrdinalIgnoreCase);
+        return TSqlTokenizer.Tokenize(expression).Any(item =>
+            item.Kind == TSqlTokenKind.Word &&
+            (nonImmutable.Contains(item.Text) ||
+             item.Text.Equals("CURRENT_TIMESTAMP", StringComparison.OrdinalIgnoreCase) ||
+             item.Text.Equals("CURRENT_DATE", StringComparison.OrdinalIgnoreCase) ||
+             item.Text.Equals("CURRENT_TIME", StringComparison.OrdinalIgnoreCase)));
+    }
+
+    private static bool ContainsTargetRoutineCall(
+        string expression,
+        Dictionary<string, TargetRoutineSignature> signatures)
+    {
+        var tokens = TSqlTokenizer.Tokenize(expression);
+        for (var index = 0; index < tokens.Count; index++)
+        {
+            if (tokens[index].Kind is not TSqlTokenKind.Word and not TSqlTokenKind.QuotedIdentifier)
+            {
+                continue;
+            }
+            var dot = NextSignificantIndex(tokens, index);
+            var name = dot >= 0 ? NextSignificantIndex(tokens, dot) : -1;
+            var open = name >= 0 ? NextSignificantIndex(tokens, name) : -1;
+            if (dot >= 0 && name >= 0 && open >= 0 &&
+                tokens[dot].Text == "." &&
+                tokens[name].Kind is TSqlTokenKind.Word or TSqlTokenKind.QuotedIdentifier &&
+                tokens[open].Text == "(" &&
+                signatures.ContainsKey(
+                    $"{tokens[index].Text.Trim('"')}.{tokens[name].Text.Trim('"')}"))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static int NextSignificantIndex(IReadOnlyList<TSqlToken> tokens, int index)
+    {
+        for (var cursor = index + 1; cursor < tokens.Count; cursor++)
+        {
+            if (tokens[cursor].Kind is not TSqlTokenKind.Whitespace and not TSqlTokenKind.Comment)
+            {
+                return cursor;
+            }
+        }
+        return -1;
+    }
+
+    private static Dictionary<string, TargetRoutineSignature> BuildTargetRoutineSignatures(
+        ConversionContext context)
+    {
+        var signatures = new Dictionary<string, TargetRoutineSignature>(StringComparer.OrdinalIgnoreCase);
+        foreach (var module in context.Inventory.Modules)
+        {
+            if (!context.ObjectsById.TryGetValue(module.ObjectId, out var routine) ||
+                routine.ObjectType != InventoryObjectType.Function)
+            {
+                continue;
+            }
+            var parameters = module.Parameters
+                .Where(item => item.ParameterId != 0)
+                .OrderBy(item => item.ParameterId)
+                .Select(item => context.TypeMappings.Map(
+                    item.TypeName,
+                    item.MaximumLength,
+                    item.Precision,
+                    item.Scale,
+                    context.Options).TargetType)
+                .ToArray();
+            var result = module.ResultColumns.Count == 0 ? null : module.ResultColumns[0];
+            var returnParameter = module.Parameters.FirstOrDefault(item => item.ParameterId == 0);
+            var returnType = result is not null
+                ? context.TypeMappings.Map(
+                    result.SystemTypeName,
+                    result.MaximumLength,
+                    result.Precision,
+                    result.Scale,
+                    context.Options).TargetType
+                : returnParameter is null
+                    ? null
+                    : context.TypeMappings.Map(
+                        returnParameter.TypeName,
+                        returnParameter.MaximumLength,
+                        returnParameter.Precision,
+                        returnParameter.Scale,
+                        context.Options).TargetType;
+            signatures[context.Identifiers.MapObject(routine).QualifiedName] =
+                new TargetRoutineSignature(parameters, returnType);
+        }
+        return signatures;
+    }
+
+    private static void AppendComputedCompatibilityTrigger(
+        StringBuilder sql,
+        InventoryObject source,
+        TargetObjectIdentifier target,
+        IReadOnlyList<ComputedCompatibilityAssignment> assignments,
+        Dictionary<string, string> columnNames,
+        IIdentifierMapper identifiers)
+    {
+        var functionName = identifiers.MapChildIdentifier(
+            source.Id,
+            "helper",
+            source.SourceSchema,
+            $"{source.SourceName}_computed_compat_fn");
+        var triggerName = identifiers.MapChildIdentifier(
+            source.Id,
+            "helper",
+            source.SourceSchema,
+            $"{source.SourceName}_computed_compat_trg");
+        sql.AppendLine()
+            .Append("CREATE OR REPLACE FUNCTION ").Append(target.Schema).Append('.').Append(functionName)
+            .AppendLine("() RETURNS trigger")
+            .AppendLine("LANGUAGE plpgsql")
+            .AppendLine("AS $migrationstudio$")
+            .AppendLine("BEGIN");
+        foreach (var assignment in assignments)
+        {
+            sql.Append("    NEW.").Append(assignment.TargetColumn).Append(" := ")
+                .Append(PrefixTriggerColumnReferences(assignment.Sql, columnNames))
+                .AppendLine(";");
+        }
+        sql.AppendLine("    RETURN NEW;")
+            .AppendLine("END;")
+            .AppendLine("$migrationstudio$;")
+            .Append("CREATE TRIGGER ").Append(triggerName)
+            .Append(" BEFORE INSERT OR UPDATE");
+        var updateColumns = assignments
+            .SelectMany(item =>
+                item.ReferencedColumns
+                    .Where(columnNames.ContainsKey)
+                    .Select(column => columnNames[column])
+                    .Concat(FindReferencedTargetColumns(item.Sql, columnNames)))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Order(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (updateColumns.Length > 0)
+        {
+            sql.Append(" OF ").Append(string.Join(", ", updateColumns));
+        }
+        sql.Append(" ON ").Append(target.QualifiedName).AppendLine()
+            .Append("FOR EACH ROW EXECUTE FUNCTION ").Append(target.Schema).Append('.').Append(functionName)
+            .AppendLine("();");
+    }
+
+    private static string PrefixTriggerColumnReferences(
+        string expression,
+        Dictionary<string, string> columnNames)
+    {
+        var mappedReferences = columnNames.Values.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var tokens = TSqlTokenizer.Tokenize(expression).ToList();
+        for (var index = 0; index < tokens.Count; index++)
+        {
+            if (tokens[index].Kind is not TSqlTokenKind.Word and not TSqlTokenKind.QuotedIdentifier ||
+                !mappedReferences.Contains(tokens[index].Text.Trim('"')))
+            {
+                continue;
+            }
+            var previous = PreviousSignificantIndex(tokens, index);
+            var next = NextSignificantIndex(tokens, index);
+            if ((previous < 0 || tokens[previous].Text != ".") &&
+                (next < 0 || tokens[next].Text != "("))
+            {
+                tokens[index] = tokens[index] with { Text = $"NEW.{tokens[index].Text}" };
+            }
+        }
+        return string.Concat(tokens.Select(item => item.Text));
+    }
+
+    private static string[] FindReferencedTargetColumns(
+        string expression,
+        Dictionary<string, string> columnNames)
+    {
+        var mappedReferences = columnNames.Values.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        return TSqlTokenizer.Tokenize(expression)
+            .Where(item =>
+                item.Kind is TSqlTokenKind.Word or TSqlTokenKind.QuotedIdentifier &&
+                mappedReferences.Contains(item.Text.Trim('"')))
+            .Select(item => item.Text.Trim('"'))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static string[] FindSourceReferencedColumns(
+        string expression,
+        IEnumerable<string> sourceColumnNames)
+    {
+        var knownColumns = sourceColumnNames.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        return TSqlTokenizer.Tokenize(expression)
+            .Where(item =>
+                item.Kind is TSqlTokenKind.Word or TSqlTokenKind.QuotedIdentifier &&
+                knownColumns.Contains(item.Text.Trim('[', ']', '"')))
+            .Select(item => item.Text.Trim('[', ']', '"'))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static int PreviousSignificantIndex(List<TSqlToken> tokens, int index)
+    {
+        for (var cursor = index - 1; cursor >= 0; cursor--)
+        {
+            if (tokens[cursor].Kind is not TSqlTokenKind.Whitespace and not TSqlTokenKind.Comment)
+            {
+                return cursor;
+            }
+        }
+        return -1;
+    }
+
+    private sealed record ComputedCompatibilityAssignment(
+        string TargetColumn,
+        string Sql,
+        IReadOnlyList<string> ReferencedColumns);
 
     private static bool AppendIdentity(
         StringBuilder definition,

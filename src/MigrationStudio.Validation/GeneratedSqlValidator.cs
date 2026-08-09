@@ -601,6 +601,11 @@ public sealed class GeneratedSqlValidator : IGeneratedSqlValidator
     private static string? ValidateGeneratedPatterns(string sql)
     {
         var code = MaskLiteralsIdentifiersAndComments(sql);
+        var focusedPatternError = FindFocusedGeneratedPatternError(sql, code);
+        if (focusedPatternError is not null)
+        {
+            return focusedPatternError;
+        }
         if (Regex.IsMatch(code, @"@\p{L}[\p{L}\p{N}_$#]*", RegexOptions.CultureInvariant))
         {
             return "Generated PostgreSQL contains an unresolved SQL Server @variable.";
@@ -614,6 +619,49 @@ public sealed class GeneratedSqlValidator : IGeneratedSqlValidator
                 RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
         {
             return "Generated PostgreSQL contains a SQL Server SELECT @variable assignment.";
+        }
+        var unresolvedSqlServerPatterns = new (string Pattern, string Construct)[]
+        {
+            (@"\bDECLARE\s+@", "DECLARE @variable"),
+            (@"\bSET\s+@", "SET @variable"),
+            (@"\bPRINT\b", "PRINT"),
+            (@"\bRAISERROR\b", "RAISERROR"),
+            (@"\bBEGIN\s+(?:TRY|CATCH)\b", "TRY/CATCH"),
+            (@"\bSP_EXECUTESQL\b", "sp_executesql"),
+            (@"@@[\p{L}_][\p{L}\p{N}_$#]*", "@@ system variable"),
+            (@"\b(?:SCOPE_IDENTITY|IDENT_CURRENT)\s*\(", "SQL Server identity function"),
+            (@"\bWAITFOR\b", "WAITFOR"),
+            (@"\bGOTO\b", "GOTO"),
+            (@"(?:^|[\s,(])##?[\p{L}_][\p{L}\p{N}_$#]*", "# temporary-table identifier"),
+            (@"\bOUTPUT\s+(?:INSERTED|DELETED)\b", "OUTPUT clause"),
+            (@"\b(?:PIVOT|UNPIVOT)\b", "PIVOT/UNPIVOT"),
+            (@"\bFOR\s+(?:XML|JSON)\b", "FOR XML/JSON"),
+            (@"\bOPTION\s*\(", "OPTION query hint"),
+            (@"\bWITH\s*\(\s*(?:NOLOCK|UPDLOCK|HOLDLOCK|ROWLOCK|TABLOCK)", "table hint")
+        };
+        foreach (var (pattern, construct) in unresolvedSqlServerPatterns)
+        {
+            if (Regex.IsMatch(
+                    code,
+                    pattern,
+                    RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Multiline))
+            {
+                return $"Generated PostgreSQL contains unresolved SQL Server {construct} syntax.";
+            }
+        }
+        if (Regex.IsMatch(
+                code,
+                @"\bEXEC(?:UTE)?\s*(?:\(|@|N?')",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+        {
+            return "Generated PostgreSQL contains unresolved SQL Server dynamic EXEC syntax.";
+        }
+        if (Regex.IsMatch(
+                code,
+                @"(?m)^\s*[\p{L}_][\p{L}\p{N}_$#]*\s*:\s*(?:--.*)?$",
+                RegexOptions.CultureInvariant))
+        {
+            return "Generated PostgreSQL contains a SQL Server label.";
         }
         if (Regex.IsMatch(
                 code,
@@ -648,6 +696,139 @@ public sealed class GeneratedSqlValidator : IGeneratedSqlValidator
         }
 
         return ValidateRoutineVariables(code);
+    }
+
+    private static string? FindFocusedGeneratedPatternError(string sql, string code)
+    {
+        var operatorCode = MaskCommentsAndStringContents(sql);
+        var rules = new (string Id, string Subsystem, string Pattern, RegexOptions Options, string Message)[]
+        {
+            ("PGSQL101", "SQL expression translation", @"\|\|\s*\|\|", RegexOptions.CultureInvariant,
+                "adjacent concatenation operators have an empty operand"),
+            ("PGSQL102", "procedural assignment emission", @":=\s*;", RegexOptions.CultureInvariant,
+                "an assignment has an empty expression"),
+            ("PGSQL103", "date/time expression conversion", @"\bINTERVAL\s*\*\s*INTERVAL\b",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
+                "duplicated INTERVAL operands form invalid arithmetic"),
+            ("PGSQL104", "local declaration parsing",
+                @"\bv_[\p{L}_][\p{L}\p{N}_$]*\s+[\p{L}_][\p{L}\p{N}_$]*(?:\s*\([^)]*\))?\s*:=\s*v_[\p{L}_][\p{L}\p{N}_$]*\s*:=",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
+                "a declaration initializer consumed the following assignment"),
+            (
+    "PGSQL105",
+    "table/generated-column emission",
+    @"\bGENERATED\s+ALWAYS\s+AS\s*\(" +
+    @"(?:(?!\)\s*STORED\b)[\s\S])*?" +
+    @"\b(?:random|now|clock_timestamp|statement_timestamp|transaction_timestamp|timeofday|CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME)\b",
+    RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
+    "a stored generated column contains a non-immutable operation"
+),
+            ("PGSQL106", "date/time expression conversion",
+                @"\btimestamp(?:\s*\([^)]*\))?\s+without\s+time\s+zone\s+GENERATED\s+ALWAYS\s+AS\s*\([^;]*-\s*\(?\s*\d+\s*\)?(?!\s*\*)",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
+                "timestamp day arithmetic subtracts a bare integer"),
+            ("PGSQL107", "view relation rewriting",
+                @"\b(?:FROM|JOIN)\s+([A-Z][A-Za-z0-9_$]*)\b",
+                RegexOptions.CultureInvariant,
+                "a view contains an unresolved source-style unqualified relation")
+        };
+        foreach (var rule in rules)
+        {
+            if (rule.Id == "PGSQL107" &&
+                !Regex.IsMatch(
+                    code,
+                    @"\bCREATE\s+(?:OR\s+REPLACE\s+)?VIEW\b",
+                    RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+            {
+                continue;
+            }
+            var match = Regex.Match(
+                rule.Id is "PGSQL101" or "PGSQL102" or "PGSQL107" ? operatorCode : code,
+                rule.Pattern,
+                rule.Options);
+            if (!match.Success)
+            {
+                continue;
+            }
+            var line = 1;
+            var column = 1;
+            for (var index = 0; index < match.Index; index++)
+            {
+                if (sql[index] == '\n')
+                {
+                    line++;
+                    column = 1;
+                }
+                else
+                {
+                    column++;
+                }
+            }
+            return $"[{rule.Id}] {rule.Subsystem} at line {line}, column {column}: {rule.Message}.";
+        }
+        return null;
+    }
+
+    private static string MaskCommentsAndStringContents(string sql)
+    {
+        var output = new StringBuilder(sql.Length);
+        var state = ScanState.Normal;
+        for (var index = 0; index < sql.Length; index++)
+        {
+            var current = sql[index];
+            var next = index + 1 < sql.Length ? sql[index + 1] : '\0';
+            if (state == ScanState.Normal && current == '-' && next == '-')
+            {
+                output.Append("  ");
+                index++;
+                state = ScanState.LineComment;
+            }
+            else if (state == ScanState.Normal && current == '/' && next == '*')
+            {
+                output.Append("  ");
+                index++;
+                state = ScanState.BlockComment;
+            }
+            else if (state == ScanState.Normal && current == '\'')
+            {
+                output.Append('\'');
+                state = ScanState.String;
+            }
+            else if (state == ScanState.String && current == '\'' && next == '\'')
+            {
+                output.Append("xx");
+                index++;
+            }
+            else if (state == ScanState.String && current == '\'')
+            {
+                output.Append('\'');
+                state = ScanState.Normal;
+            }
+            else if (state == ScanState.LineComment && current is '\r' or '\n')
+            {
+                output.Append(current);
+                state = ScanState.Normal;
+            }
+            else if (state == ScanState.BlockComment && current == '*' && next == '/')
+            {
+                output.Append("  ");
+                index++;
+                state = ScanState.Normal;
+            }
+            else if (state is ScanState.LineComment or ScanState.BlockComment)
+            {
+                output.Append(current is '\r' or '\n' ? current : ' ');
+            }
+            else if (state == ScanState.String)
+            {
+                output.Append(current is '\r' or '\n' ? current : 'x');
+            }
+            else
+            {
+                output.Append(current);
+            }
+        }
+        return output.ToString();
     }
 
     private static string? ValidateRoutineVariables(string code)

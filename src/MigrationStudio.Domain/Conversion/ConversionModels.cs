@@ -1,4 +1,5 @@
 using MigrationStudio.Domain.Inventory;
+using MigrationStudio.Domain.Deployment;
 
 namespace MigrationStudio.Domain.Conversion;
 
@@ -520,6 +521,8 @@ public sealed record ConversionRun(
 
     public IdentifierMappingSetMetadata MappingSet { get; init; } =
         IdentifierMappingSetMetadata.Legacy;
+
+    public BlockedDependencyReconciliation? PublicationReconciliation { get; init; }
 }
 
 public sealed record ConversionResult<TTarget>(
