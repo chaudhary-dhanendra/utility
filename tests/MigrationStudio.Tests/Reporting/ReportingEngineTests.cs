@@ -92,6 +92,33 @@ public sealed class ReportingEngineTests
     }
 
     [Fact]
+    public async Task GeneratesPackageDirectlyInRequestedDirectory()
+    {
+        using var workspace = new TemporaryWorkspace();
+        using var history = new JsonRunHistoryStore(workspace.Paths, new SensitiveDataRedactor());
+        var engine = new MigrationReportEngine(
+            new ReportTemplateValidator(),
+            new SensitiveDataRedactor(),
+            history);
+        var reportsDirectory = Path.Combine(workspace.Root, "per-user", "migration-run");
+        Directory.CreateDirectory(reportsDirectory);
+        var unrelatedFile = Path.Combine(reportsDirectory, "user-notes.txt");
+        await File.WriteAllTextAsync(unrelatedFile, "retain me");
+
+        var result = await engine.GenerateToDirectoryAsync(
+            ReportingFixture.CreateRequest(),
+            reportsDirectory,
+            null,
+            CancellationToken.None);
+
+        Assert.Equal(reportsDirectory, result.ReportsDirectory);
+        Assert.Equal(11, result.Files.Count);
+        Assert.All(result.Files, path => Assert.Equal(reportsDirectory, Path.GetDirectoryName(path)));
+        Assert.False(Directory.Exists(Path.Combine(reportsDirectory, "Reports")));
+        Assert.Equal("retain me", await File.ReadAllTextAsync(unrelatedFile));
+    }
+
+    [Fact]
     public void WorkbookSanitizesNamesAndContinuesAtConfiguredLimit()
     {
         using var workspace = new TemporaryWorkspace();

@@ -434,6 +434,7 @@ public sealed class PostMigrationValidationEngine(
         CancellationToken cancellationToken)
     {
         const int maxDegreeOfParallelism = 4;
+        const int maxTransientRetries = 3;
 
         var tables = request.SourceSnapshot.Objects.Where(item =>
             item.IsIncluded &&
@@ -493,124 +494,128 @@ public sealed class PostMigrationValidationEngine(
                     return;
                 }
 
-                // Each parallel worker owns separate connections. ADO.NET
-                // connections/readers are not shared between concurrent tables.
-                await using var source =
-                    new SqlConnection(request.Connections.SourceConnectionString);
-                await using var target =
-                    new NpgsqlConnection(request.Connections.TargetConnectionString);
+                columnsByTable.TryGetValue(table.Id, out var columns);
+                columns ??= [];
 
-                await Task.WhenAll(
-                    source.OpenAsync(token),
-                    target.OpenAsync(token)).ConfigureAwait(false);
+                primaryKeysByTable.TryGetValue(table.Id, out var keyColumns);
+                keyColumns ??= [];
 
-                var sourceRelation =
-                    $"{QuoteSqlServer(table.SourceSchema)}.{QuoteSqlServer(table.SourceName)}";
-                var targetRelation =
-                    $"{QuotePostgreSql(Unquote(mapping.TargetSchema))}.{QuotePostgreSql(Unquote(mapping.TargetName))}";
-
-                var sourceCountTask = CountAsync(source, sourceRelation, token);
-                var targetCountTask = CountAsync(target, targetRelation, token);
-                await Task.WhenAll(sourceCountTask, targetCountTask).ConfigureAwait(false);
-
-                var sourceCount = await sourceCountTask.ConfigureAwait(false);
-                var targetCount = await targetCountTask.ConfigureAwait(false);
-
-                string? sourceHash = null;
-                string? targetHash = null;
-                IReadOnlyList<ColumnDataMetric> sourceMetrics = [];
-                IReadOnlyList<ColumnDataMetric> targetMetrics = [];
-                var ordered = false;
-
-                if (request.Configuration.Level is ValidationLevel.DataSampling or
-                    ValidationLevel.DataComprehensive or ValidationLevel.Full)
+                try
                 {
-                    columnsByTable.TryGetValue(table.Id, out var columns);
-                    columns ??= [];
+                    var sourceTask = ValidateTableSideWithRetryAsync(
+                        request,
+                        table,
+                        mapping,
+                        columns,
+                        keyColumns,
+                        source: true,
+                        maxTransientRetries,
+                        () => Volatile.Read(ref completed),
+                        tables.Length,
+                        progress,
+                        token);
 
-                    primaryKeysByTable.TryGetValue(table.Id, out var keyColumns);
-                    keyColumns ??= [];
+                    var targetTask = ValidateTableSideWithRetryAsync(
+                        request,
+                        table,
+                        mapping,
+                        columns,
+                        keyColumns,
+                        source: false,
+                        maxTransientRetries,
+                        () => Volatile.Read(ref completed),
+                        tables.Length,
+                        progress,
+                        token);
 
-                    ordered = keyColumns.Length > 0;
+                    await Task.WhenAll(sourceTask, targetTask).ConfigureAwait(false);
+                    var sourceResult = await sourceTask.ConfigureAwait(false);
+                    var targetResult = await targetTask.ConfigureAwait(false);
 
-                    var limit = request.Configuration.Level == ValidationLevel.DataSampling
-                        ? request.Configuration.SampleSize
-                        : int.MaxValue;
+                    var ordered = keyColumns.Length > 0;
+                    var sourceHash = sourceResult.Checksum;
+                    var targetHash = targetResult.Checksum;
 
-                    if (columns.Length > 0)
-                    {
-                        var sourceProfileTask = ProfileRowsAsync(
-                            source, table, mapping, request.Conversion,
-                            columns, keyColumns, limit, true,
-                            request.Configuration, token);
-
-                        var targetProfileTask = ProfileRowsAsync(
-                            target, table, mapping, request.Conversion,
-                            columns, keyColumns, limit, false,
-                            request.Configuration, token);
-
-                        await Task.WhenAll(sourceProfileTask, targetProfileTask).ConfigureAwait(false);
-
-                        var sourceProfile = await sourceProfileTask.ConfigureAwait(false);
-                        var targetProfile = await targetProfileTask.ConfigureAwait(false);
-
-                        sourceHash = sourceProfile.Checksum;
-                        targetHash = targetProfile.Checksum;
-                        sourceMetrics = sourceProfile.Metrics;
-                        targetMetrics = targetProfile.Metrics;
-                    }
-                }
-
-                var classification = sourceCount != targetCount
-                    ? ComparisonClassification.Mismatch
-                    : sourceHash is not null &&
-                      !string.Equals(sourceHash, targetHash, StringComparison.Ordinal)
+                    var classification = sourceResult.RowCount != targetResult.RowCount
                         ? ComparisonClassification.Mismatch
-                        : ComparisonClassification.Equivalent;
+                        : sourceHash is not null &&
+                          !string.Equals(sourceHash, targetHash, StringComparison.Ordinal)
+                            ? ComparisonClassification.Mismatch
+                            : ComparisonClassification.Equivalent;
 
-                var detail = sourceCount != targetCount
-                    ? $"Row counts differ ({sourceCount} source, {targetCount} target)."
-                    : sourceHash is not null &&
-                      classification == ComparisonClassification.Mismatch
-                        ? "Canonical data checksums differ; values are not included in the finding."
-                        : sourceHash is null
-                            ? "Row counts match."
-                            : "Row counts and canonical checksums match.";
+                    var detail = sourceResult.RowCount != targetResult.RowCount
+                        ? $"Row counts differ ({sourceResult.RowCount} source, {targetResult.RowCount} target)."
+                        : sourceHash is not null &&
+                          classification == ComparisonClassification.Mismatch
+                            ? "Canonical data checksums differ; values are not included in the finding."
+                            : sourceHash is null
+                                ? "Row counts match."
+                                : "Row counts and canonical checksums match.";
 
-                var ruleId = sourceCount != targetCount ? "DATA.ROW_COUNT" : "DATA.CHECKSUM";
-                var severity = ValidationSeverityPolicy.Resolve(
-                    ruleId, classification, request.Configuration);
+                    var ruleId = sourceResult.RowCount != targetResult.RowCount
+                        ? "DATA.ROW_COUNT"
+                        : "DATA.CHECKSUM";
+                    var severity = ValidationSeverityPolicy.Resolve(
+                        ruleId, classification, request.Configuration);
 
-                // Buffer per-table output; merge after parallel work so the shared
-                // List<ValidationFinding> is never written concurrently.
-                findingBuffer[tableIndex] = new ValidationFinding(
-                    ruleId,
-                    ValidationCategory.DataReconciliation,
-                    severity,
-                    classification,
-                    "Table",
-                    table.QualifiedSourceName,
-                    mapping.TargetQualifiedName,
-                    detail,
-                    null,
-                    null);
+                    findingBuffer[tableIndex] = new ValidationFinding(
+                        ruleId,
+                        ValidationCategory.DataReconciliation,
+                        severity,
+                        classification,
+                        "Table",
+                        table.QualifiedSourceName,
+                        mapping.TargetQualifiedName,
+                        detail,
+                        null,
+                        null);
 
-                results[tableIndex] = new TableDataComparison(
-                    table.QualifiedSourceName,
-                    mapping.TargetQualifiedName,
-                    sourceCount,
-                    targetCount,
-                    sourceHash,
-                    targetHash,
-                    ordered,
-                    sourceMetrics,
-                    targetMetrics,
-                    classification,
-                    detail);
+                    results[tableIndex] = new TableDataComparison(
+                        table.QualifiedSourceName,
+                        mapping.TargetQualifiedName,
+                        sourceResult.RowCount,
+                        targetResult.RowCount,
+                        sourceHash,
+                        targetHash,
+                        ordered,
+                        sourceResult.Metrics,
+                        targetResult.Metrics,
+                        classification,
+                        detail);
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception exception) when (
+                    exception is DbException or InvalidOperationException or TimeoutException)
+                {
+                    const string ruleId = "DATA.VALIDATION_FAILED";
+                    var classification = ComparisonClassification.NotComparable;
+                    var severity = ValidationSeverityPolicy.Resolve(
+                        ruleId, classification, request.Configuration);
+                    var detail =
+                        $"Data validation failed for this table after retry handling. " +
+                        $"{exception.GetType().Name}: {exception.Message}";
 
-                var done = Interlocked.Increment(ref completed);
-                progress?.Report(new ValidationProgress(
-                    "Data", done, tables.Length, table.QualifiedSourceName));
+                    findingBuffer[tableIndex] = new ValidationFinding(
+                        ruleId,
+                        ValidationCategory.DataReconciliation,
+                        severity,
+                        classification,
+                        "Table",
+                        table.QualifiedSourceName,
+                        mapping.TargetQualifiedName,
+                        detail,
+                        null,
+                        null);
+                }
+                finally
+                {
+                    var done = Interlocked.Increment(ref completed);
+                    progress?.Report(new ValidationProgress(
+                        "Data", done, tables.Length, table.QualifiedSourceName));
+                }
             }).ConfigureAwait(false);
 
         foreach (var finding in findingBuffer)
@@ -626,6 +631,142 @@ public sealed class PostMigrationValidationEngine(
             .Select(item => item!)
             .ToArray();
     }
+
+    private async Task<TableSideValidationResult> ValidateTableSideWithRetryAsync(
+        ValidationRequest request,
+        InventoryObject table,
+        IdentifierMappingEntry mapping,
+        ColumnInventory[] columns,
+        IReadOnlyList<string> keyColumns,
+        bool source,
+        int maxTransientRetries,
+        Func<int> completedProvider,
+        int totalTables,
+        IProgress<ValidationProgress>? progress,
+        CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            try
+            {
+                await using DbConnection connection = source
+                    ? new SqlConnection(request.Connections.SourceConnectionString)
+                    : new NpgsqlConnection(request.Connections.TargetConnectionString);
+
+                await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+
+                var relation = source
+                    ? $"{QuoteSqlServer(table.SourceSchema)}.{QuoteSqlServer(table.SourceName)}"
+                    : $"{QuotePostgreSql(Unquote(mapping.TargetSchema))}.{QuotePostgreSql(Unquote(mapping.TargetName))}";
+
+                var rowCount = await CountAsync(
+                    connection, relation, cancellationToken).ConfigureAwait(false);
+
+                string? checksum = null;
+                IReadOnlyList<ColumnDataMetric> metrics = [];
+
+                if (request.Configuration.Level is ValidationLevel.DataSampling or
+                    ValidationLevel.DataComprehensive or ValidationLevel.Full)
+                {
+                    var limit = request.Configuration.Level == ValidationLevel.DataSampling
+                        ? request.Configuration.SampleSize
+                        : int.MaxValue;
+
+                    if (columns.Length > 0)
+                    {
+                        var profile = await ProfileRowsAsync(
+                            connection,
+                            table,
+                            mapping,
+                            request.Conversion,
+                            columns,
+                            keyColumns,
+                            limit,
+                            source,
+                            request.Configuration,
+                            cancellationToken).ConfigureAwait(false);
+
+                        checksum = profile.Checksum;
+                        metrics = profile.Metrics;
+                    }
+                }
+
+                return new TableSideValidationResult(rowCount, checksum, metrics);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception exception) when (
+                attempt < maxTransientRetries &&
+                IsTransientValidationException(exception))
+            {
+                var retryNumber = attempt + 1;
+                var delay = GetValidationRetryDelay(retryNumber);
+                var side = source ? "SQL Server" : "PostgreSQL";
+
+                progress?.Report(new ValidationProgress(
+                    "Data",
+                    completedProvider(),
+                    totalTables,
+                    $"{table.QualifiedSourceName} · {side} transient failure; " +
+                    $"retry {retryNumber}/{maxTransientRetries} in {delay.TotalSeconds:0}s"));
+
+                await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private static bool IsTransientValidationException(Exception exception)
+    {
+        if (exception is OperationCanceledException)
+        {
+            return false;
+        }
+
+        if (exception is TimeoutException)
+        {
+            return true;
+        }
+
+        if (exception is SqlException sqlException)
+        {
+            if (sqlException.IsTransient ||
+                sqlException.Number is -2 or 20 or 64 or 233 or 10053 or 10054 or 10060)
+            {
+                return true;
+            }
+        }
+
+        if (exception is DbException dbException && dbException.IsTransient)
+        {
+            return true;
+        }
+
+        var message = exception.Message;
+        if (message.Contains("forcibly closed", StringComparison.OrdinalIgnoreCase) ||
+            message.Contains("transport-level error", StringComparison.OrdinalIgnoreCase) ||
+            message.Contains("connection is broken", StringComparison.OrdinalIgnoreCase) ||
+            message.Contains("connection was closed", StringComparison.OrdinalIgnoreCase) ||
+            message.Contains("connection reset", StringComparison.OrdinalIgnoreCase) ||
+            message.Contains("timeout", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return exception.InnerException is not null &&
+               IsTransientValidationException(exception.InnerException);
+    }
+
+    private static TimeSpan GetValidationRetryDelay(int retryNumber) =>
+        retryNumber switch
+        {
+            1 => TimeSpan.FromSeconds(2),
+            2 => TimeSpan.FromSeconds(5),
+            _ => TimeSpan.FromSeconds(10)
+        };
 
     private async Task<DataProfile> ProfileRowsAsync(
         DbConnection connection,
@@ -1745,6 +1886,11 @@ public sealed class PostMigrationValidationEngine(
 
     private static string QuotePostgreSql(string value) =>
         MigrationStudio.Application.Conversion.PostgreSqlIdentifierQuoter.Quote(value);
+
+    private sealed record TableSideValidationResult(
+        long RowCount,
+        string? Checksum,
+        IReadOnlyList<ColumnDataMetric> Metrics);
 
     private sealed record DataProfile(
         string Checksum,

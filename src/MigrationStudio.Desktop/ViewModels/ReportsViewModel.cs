@@ -22,6 +22,7 @@ public sealed partial class ReportsViewModel : ObservableObject
     private readonly IDataMigrationSession _dataMigration;
     private readonly IDeploymentSession _deployment;
     private readonly IValidationSession _validation;
+    private readonly IMigrationReportCoordinator _reportCoordinator;
     private readonly IMigrationReportEngine _reports;
     private readonly IManualReviewStore _manualReviewStore;
     private readonly IRunHistoryStore _historyStore;
@@ -60,6 +61,7 @@ public sealed partial class ReportsViewModel : ObservableObject
         IDataMigrationSession dataMigration,
         IDeploymentSession deployment,
         IValidationSession validation,
+        IMigrationReportCoordinator reportCoordinator,
         IMigrationReportEngine reports,
         IManualReviewStore manualReviewStore,
         IRunHistoryStore historyStore,
@@ -72,6 +74,7 @@ public sealed partial class ReportsViewModel : ObservableObject
         _dataMigration = dataMigration;
         _deployment = deployment;
         _validation = validation;
+        _reportCoordinator = reportCoordinator;
         _reports = reports;
         _manualReviewStore = manualReviewStore;
         _historyStore = historyStore;
@@ -128,14 +131,13 @@ public sealed partial class ReportsViewModel : ObservableObject
         {
             IsBusy = true;
             Progress = 0;
-            var request = CreateRequest();
             var reporter = new Progress<ReportGenerationProgress>(item =>
             {
                 Progress = item.Percentage;
                 Status = $"{item.Stage}: {item.CurrentFile}";
             });
-            var result = await _reports.GenerateAsync(
-                request, parent, reporter, CancellationToken.None);
+            var result = await _reportCoordinator.GenerateAsync(
+                CreateRequestOptions(), parent, reporter, CancellationToken.None);
             LastReportDirectory = result.ReportsDirectory;
             ReportFiles.Clear();
             foreach (var file in result.Files)
@@ -315,27 +317,11 @@ public sealed partial class ReportsViewModel : ObservableObject
 
     partial void OnShowOnlyUnresolvedChanged(bool value) => ApplyManualReviewFilter();
 
-    private MigrationReportRequest CreateRequest()
-    {
-        var snapshot = _inventory.Current!;
-        var manualReviews = ManualReviews.Select(item => item.ToRecord()).ToArray();
-        return new MigrationReportRequest
+    private MigrationReportRequestOptions CreateRequestOptions() =>
+        new()
         {
-            Inventory = snapshot,
-            Conversion = _conversion.Current,
-            DataMigration = _dataMigration.CurrentResult,
-            Deployment = _deployment.Result,
-            Validation = _validation.Current,
-            Source = new MigrationEndpointSummary(
-                SourceServer,
-                snapshot.Database.DatabaseName,
-                snapshot.Database.ProductVersion,
-                snapshot.Database.Edition),
-            Target = new MigrationEndpointSummary(
-                TargetServer,
-                _deployment.Result?.TargetDatabase ?? "Not recorded",
-                _conversion.Current?.TargetVersion.ToString() ?? "Not recorded",
-                "PostgreSQL"),
+            SourceServer = SourceServer,
+            TargetServer = TargetServer,
             Template = new ReportTemplate
             {
                 TemplateId = UseDarkDashboardTheme ? "dashboard-dark" : "professional-light",
@@ -349,10 +335,9 @@ public sealed partial class ReportsViewModel : ObservableObject
                 LogoPath = string.IsNullOrWhiteSpace(LogoPath) ? null : LogoPath,
                 UseDarkDashboardTheme = UseDarkDashboardTheme
             },
-            ManualReviews = manualReviews,
+            ManualReviews = ManualReviews.Select(item => item.ToRecord()).ToArray(),
             ApplicationVersion = typeof(ReportsViewModel).Assembly.GetName().Version?.ToString() ?? "1.0.0"
         };
-    }
 
     private void RefreshDashboard()
     {

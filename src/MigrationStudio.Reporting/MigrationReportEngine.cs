@@ -15,21 +15,32 @@ public sealed class MigrationReportEngine(
 {
     private static readonly JsonSerializerOptions JsonOptions = CreateJsonOptions();
 
-    public async Task<ReportPackageResult> GenerateAsync(
+    public Task<ReportPackageResult> GenerateAsync(
         MigrationReportRequest request,
         string parentDirectory,
         IProgress<ReportGenerationProgress>? progress,
         CancellationToken cancellationToken)
     {
-        ArgumentNullException.ThrowIfNull(request);
         ArgumentException.ThrowIfNullOrWhiteSpace(parentDirectory);
+        return GenerateToDirectoryAsync(
+            request, Path.Combine(parentDirectory, "Reports"), progress, cancellationToken);
+    }
+
+    public async Task<ReportPackageResult> GenerateToDirectoryAsync(
+        MigrationReportRequest request,
+        string reportsDirectory,
+        IProgress<ReportGenerationProgress>? progress,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentException.ThrowIfNullOrWhiteSpace(reportsDirectory);
         var started = DateTimeOffset.UtcNow;
         var reportId = Guid.NewGuid();
         var template = templateValidator.Validate(request.Template);
         var report = MigrationReportDocumentBuilder.Build(request with { Template = template }, reportId);
         report = Sanitize(report);
         return await WritePackageAsync(
-            report, parentDirectory, started, null, progress, cancellationToken).ConfigureAwait(false);
+            report, reportsDirectory, started, null, progress, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<ReportPackageResult> RegenerateAsync(
@@ -59,20 +70,20 @@ public sealed class MigrationReportEngine(
         };
         regenerated = Sanitize(regenerated);
         return await WritePackageAsync(
-            regenerated, parentDirectory, started, reportRunId.ToString(), progress, cancellationToken)
+            regenerated, Path.Combine(parentDirectory, "Reports"), started, reportRunId.ToString(), progress,
+            cancellationToken)
             .ConfigureAwait(false);
     }
 
     private async Task<ReportPackageResult> WritePackageAsync(
         MigrationReportDocument report,
-        string parentDirectory,
+        string reportsDirectory,
         DateTimeOffset started,
         string? sourceReportRunId,
         IProgress<ReportGenerationProgress>? progress,
         CancellationToken cancellationToken)
     {
         var reportId = report.Summary.ReportRunId;
-        var reportsDirectory = Path.Combine(parentDirectory, "Reports");
         Directory.CreateDirectory(reportsDirectory);
         var files = new List<string>();
         const int total = 11;

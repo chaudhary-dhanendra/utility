@@ -21,6 +21,7 @@ public static class DependencyInjection
         services.AddSingleton<IRunHistoryStore, JsonRunHistoryStore>();
         services.AddSingleton<ISanitizedLogExporter, SanitizedLogExporter>();
         services.AddSingleton<IMigrationReportEngine, MigrationReportEngine>();
+        services.AddSingleton<IMigrationReportCoordinator, MigrationReportCoordinator>();
         services.AddSingleton<RunHistoryRecorderService>();
         services.AddSingleton<IHostedService>(
             provider => provider.GetRequiredService<RunHistoryRecorderService>());

@@ -24,6 +24,43 @@ public interface IMigrationReportEngine
         string parentDirectory,
         IProgress<ReportGenerationProgress>? progress,
         CancellationToken cancellationToken);
+
+    Task<ReportPackageResult> GenerateToDirectoryAsync(
+        MigrationReportRequest request,
+        string reportsDirectory,
+        IProgress<ReportGenerationProgress>? progress,
+        CancellationToken cancellationToken);
+}
+
+public sealed record MigrationReportRequestOptions
+{
+    public string SourceServer { get; init; } = "Not recorded";
+
+    public string TargetServer { get; init; } = "Not recorded";
+
+    public ReportTemplate Template { get; init; } = new();
+
+    public IReadOnlyList<ManualReviewItem>? ManualReviews { get; init; }
+
+    public string ApplicationVersion { get; init; } = "1.0.0";
+}
+
+public interface IMigrationReportCoordinator
+{
+    Task<MigrationReportRequest> CreateRequestAsync(
+        MigrationReportRequestOptions options,
+        CancellationToken cancellationToken);
+
+    Task<ReportPackageResult> GenerateAsync(
+        MigrationReportRequestOptions options,
+        string parentDirectory,
+        IProgress<ReportGenerationProgress>? progress,
+        CancellationToken cancellationToken);
+
+    Task<ReportPackageResult> GenerateDefaultAsync(
+        MigrationReportRequestOptions options,
+        IProgress<ReportGenerationProgress>? progress,
+        CancellationToken cancellationToken);
 }
 
 public interface IReportTemplateValidator

@@ -1,9 +1,12 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using Microsoft.Extensions.Logging;
 using MigrationStudio.Application.Conversion;
 using MigrationStudio.Application.Operations;
+using MigrationStudio.Application.Reporting;
 using MigrationStudio.Domain.Inventory;
 using MigrationStudio.Domain.Operations;
 
@@ -50,6 +53,8 @@ public sealed partial class MigrationWizardViewModel : ObservableObject, IDispos
 {
     private readonly IOperationMonitor _operations;
     private readonly IConversionSession _conversionSession;
+    private readonly IMigrationReportCoordinator _reportCoordinator;
+    private readonly ILogger<MigrationWizardViewModel> _logger;
     private bool _internalChange;
 
     [ObservableProperty] private MigrationWizardStep _currentStep;
@@ -60,15 +65,29 @@ public sealed partial class MigrationWizardViewModel : ObservableObject, IDispos
     [ObservableProperty] private string _activePackage = string.Empty;
     [ObservableProperty] private DateTimeOffset? _startedAt;
     [ObservableProperty] private DateTimeOffset? _finishedAt;
+    [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(GenerateReportsCommand))]
+    [NotifyCanExecuteChangedFor(nameof(OpenReportsFolderCommand))]
+    private bool _isGeneratingReports;
+    [ObservableProperty] private double _reportProgress;
+    [ObservableProperty] private string _reportStatus = "Reports have not been generated.";
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasGeneratedReports))]
+    [NotifyCanExecuteChangedFor(nameof(OpenReportsFolderCommand))]
+    private string _reportDirectory = string.Empty;
 
     public MigrationWizardViewModel(
         WorkspaceViewModel workspace,
         IOperationMonitor operations,
-        IConversionSession conversionSession)
+        IConversionSession conversionSession,
+        IMigrationReportCoordinator reportCoordinator,
+        ILogger<MigrationWizardViewModel> logger)
     {
         Workspace = workspace;
         _operations = operations;
         _conversionSession = conversionSession;
+        _reportCoordinator = reportCoordinator;
+        _logger = logger;
 
         Steps =
         [
@@ -107,6 +126,7 @@ public sealed partial class MigrationWizardViewModel : ObservableObject, IDispos
     public bool IsMigrateStep => CurrentStep == MigrationWizardStep.Migrate;
     public bool IsValidateStep => CurrentStep == MigrationWizardStep.Validate;
     public bool IsFinishStep => CurrentStep == MigrationWizardStep.Finish;
+    public bool HasGeneratedReports => !string.IsNullOrWhiteSpace(ReportDirectory);
 
     public bool SourceConnected =>
         Workspace.ConnectionStatus.StartsWith("Connected", StringComparison.OrdinalIgnoreCase) ||
@@ -443,8 +463,84 @@ public sealed partial class MigrationWizardViewModel : ObservableObject, IDispos
     {
         FinishedAt = DateTimeOffset.Now;
         SetState(MigrationWizardStep.Finish, WizardStepState.Completed, "Migration workflow complete.");
-        WorkflowMessage = "Migration complete. Reports and engineering details remain available in Advanced Mode.";
+        WorkflowMessage = "Migration complete. Standard reports are available below.";
     }
+
+    [RelayCommand(CanExecute = nameof(CanGenerateReports))]
+    private async Task GenerateReportsAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            IsGeneratingReports = true;
+            ReportProgress = 0;
+            ReportStatus = "Generating reports...";
+            var progress = new Progress<ReportGenerationProgress>(item =>
+            {
+                ReportProgress = item.Percentage;
+                if (!string.Equals(item.Stage, "Complete", StringComparison.OrdinalIgnoreCase))
+                {
+                    var currentFile = Path.GetFileName(item.CurrentFile);
+                    ReportStatus = string.IsNullOrWhiteSpace(currentFile)
+                        ? $"Generating reports... {item.Stage}"
+                        : $"Generating reports... {item.Stage}: {currentFile}";
+                }
+            });
+            var result = await _reportCoordinator.GenerateDefaultAsync(
+                new MigrationReportRequestOptions
+                {
+                    SourceServer = Workspace.Server,
+                    TargetServer = Workspace.PostgreSqlTarget.Host,
+                    ApplicationVersion = typeof(MigrationWizardViewModel).Assembly
+                        .GetName().Version?.ToString() ?? "1.0.0"
+                },
+                progress,
+                cancellationToken);
+            ReportDirectory = result.ReportsDirectory;
+            ReportProgress = 100;
+            ReportStatus = "Reports generated successfully.";
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            ReportStatus = "Report generation was cancelled. You can try again.";
+        }
+        catch (Exception exception)
+        {
+            MigrationWizardLog.ReportGenerationFailed(_logger, exception);
+            ReportStatus = $"Report generation failed: {exception.Message}";
+        }
+        finally
+        {
+            IsGeneratingReports = false;
+        }
+    }
+
+    private bool CanGenerateReports() => !IsGeneratingReports;
+
+    [RelayCommand(CanExecute = nameof(CanOpenReportsFolder))]
+    private void OpenReportsFolder()
+    {
+        try
+        {
+            if (!Directory.Exists(ReportDirectory))
+            {
+                ReportStatus = "The generated reports directory is no longer available.";
+                return;
+            }
+
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = ReportDirectory,
+                UseShellExecute = true
+            });
+        }
+        catch (Exception exception)
+        {
+            MigrationWizardLog.OpenReportsFolderFailed(_logger, ReportDirectory, exception);
+            ReportStatus = $"Could not open the reports folder: {exception.Message}";
+        }
+    }
+
+    private bool CanOpenReportsFolder() => HasGeneratedReports && !IsGeneratingReports;
 
     [RelayCommand(CanExecute = nameof(CanGoBack))]
     private void Back() => MoveTo(CurrentStep - 1);
@@ -832,4 +928,22 @@ public sealed partial class MigrationWizardViewModel : ObservableObject, IDispos
         Workspace.PropertyChanged -= OnWorkspacePropertyChanged;
         Workspace.PostgreSqlTarget.PropertyChanged -= OnTargetPropertyChanged;
     }
+}
+
+internal static partial class MigrationWizardLog
+{
+    [LoggerMessage(
+        EventId = 2130,
+        Level = LogLevel.Error,
+        Message = "Simple Mode report generation failed.")]
+    public static partial void ReportGenerationFailed(ILogger logger, Exception exception);
+
+    [LoggerMessage(
+        EventId = 2131,
+        Level = LogLevel.Error,
+        Message = "Could not open the Simple Mode reports directory {ReportDirectory}.")]
+    public static partial void OpenReportsFolderFailed(
+        ILogger logger,
+        string reportDirectory,
+        Exception exception);
 }
